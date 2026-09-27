@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS listings (
     category        TEXT NOT NULL,             -- mobil / pc / elektro / auto
     query           TEXT,                      -- поисковый запрос, по которому найдено (если был)
     title           TEXT NOT NULL,
+    listing_type    TEXT NOT NULL DEFAULT 'offer', -- offer = продаю, demand = «Koupím/Sháním»
     price_czk       INTEGER,                   -- NULL, если цена «Dohodou» / «V textu»
     location        TEXT,
     psc             TEXT,                      -- почтовый индекс (PSČ)
@@ -45,10 +46,26 @@ CREATE TABLE IF NOT EXISTS listing_snapshots (
     is_active    INTEGER NOT NULL DEFAULT 1
 );
 
+-- Общее число объявлений в рубрике / по запросу («Zobrazeno 1–20 inzerátů z N») во времени.
+CREATE TABLE IF NOT EXISTS market_counts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at  TEXT NOT NULL,                -- UTC
+    category     TEXT NOT NULL,
+    kind         TEXT NOT NULL,                -- offer (вся рубрика) / demand (поиск «koupím» и т.п.)
+    query        TEXT,                         -- поисковый запрос, если был
+    total        INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category);
 CREATE INDEX IF NOT EXISTS idx_listings_active ON listings(is_active);
 CREATE INDEX IF NOT EXISTS idx_snapshots_listing ON listing_snapshots(listing_id, captured_at);
 """
+
+# Колонки, добавленные после первой версии схемы: (таблица, колонка, определение).
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("listings", "listing_type", "TEXT NOT NULL DEFAULT 'offer'"),
+]
+POST_MIGRATION_SQL = "CREATE INDEX IF NOT EXISTS idx_listings_type ON listings(listing_type);"
 
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -89,6 +106,11 @@ def init_db(db_path: Path | str | None = None) -> Path:
     path = Path(db_path) if db_path else DB_PATH
     with get_connection(path) as conn:
         conn.executescript(SCHEMA)
+        for table, column, definition in MIGRATIONS:
+            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.executescript(POST_MIGRATION_SQL)
     return path
 
 
@@ -101,7 +123,8 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
             UPDATE listings
                SET title = ?, price_czk = COALESCE(?, price_czk), location = COALESCE(?, location),
                    psc = COALESCE(?, psc), url = ?, posted_at = COALESCE(?, posted_at),
-                   query = COALESCE(query, ?), last_seen = ?, is_active = 1, removed_at = NULL
+                   query = COALESCE(query, ?), listing_type = COALESCE(?, listing_type),
+                   last_seen = ?, is_active = 1, removed_at = NULL
              WHERE id = ?
             """,
             (
@@ -112,6 +135,7 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
                 item["url"],
                 item.get("posted_at"),
                 item.get("query"),
+                item.get("listing_type"),
                 seen_at,
                 item["id"],
             ),
@@ -119,15 +143,16 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
         return False
     conn.execute(
         """
-        INSERT INTO listings (id, category, query, title, price_czk, location, psc, url,
-                              posted_at, first_seen, last_seen, is_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        INSERT INTO listings (id, category, query, title, listing_type, price_czk, location, psc,
+                              url, posted_at, first_seen, last_seen, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         """,
         (
             item["id"],
             item["category"],
             item.get("query"),
             item["title"],
+            item.get("listing_type") or "offer",
             item.get("price_czk"),
             item.get("location"),
             item.get("psc"),
@@ -190,12 +215,27 @@ def active_listings(
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
+def add_market_count(
+    conn: sqlite3.Connection,
+    captured_at: str,
+    category: str,
+    kind: str,
+    total: int,
+    query: str | None = None,
+) -> None:
+    """Сохраняет общее число объявлений в рубрике/по запросу на момент captured_at."""
+    conn.execute(
+        "INSERT INTO market_counts (captured_at, category, kind, query, total) VALUES (?, ?, ?, ?, ?)",
+        (captured_at, category, kind, query, total),
+    )
+
+
 def table_counts(db_path: Path | str | None = None) -> dict[str, int]:
     """Число строк в таблицах — для быстрой проверки состояния базы."""
     with get_connection(db_path) as conn:
         return {
             t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            for t in ("listings", "listing_snapshots")
+            for t in ("listings", "listing_snapshots", "market_counts")
         }
 
 

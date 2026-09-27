@@ -80,7 +80,34 @@ STOPWORDS = {
     "baterie",
     "ovladače",
     "sluchátka",
+    # глаголы и обороты из объявлений «куплю»
+    "koupíme",
+    "koupime",
+    "sháním",
+    "shanim",
+    "sháníme",
+    "hledám",
+    "hledam",
+    "hledáme",
+    "poptávám",
+    "poptavam",
+    "vykoupím",
+    "vykoupim",
+    "výkup",
+    "vada",
+    "vadou",
+    "rozumná",
+    "rozumna",
+    "platba",
+    "ihned",
+    "vaše",
+    "vase",
+    "dceru",
+    "syna",
+    "ii",
+    "iii",
 }
+LISTING_TYPE_LABELS = {"offer": "Продаю", "demand": "Куплю / ищу", "buyout": "Перекупщики"}
 TOKEN_RE = re.compile(r"[a-zá-žA-ZÁ-Ž][\wá-žÁ-Ž]+", re.UNICODE)
 
 
@@ -111,6 +138,9 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         if col in df:
             df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
     df["is_active"] = df["is_active"].astype(bool)
+    if "listing_type" not in df:
+        df["listing_type"] = "offer"
+    df["listing_type"] = df["listing_type"].fillna("offer")
 
     hours = (df["last_snap_at"] - df["first_snap_at"]).dt.total_seconds() / 3600
     delta = df["views_last"] - df["views_first"]
@@ -311,9 +341,140 @@ def hottest_items(df: pd.DataFrame, n: int = 15) -> pd.DataFrame:
     return df[df["vph"].notna()].nlargest(n, "vph").reset_index(drop=True)
 
 
+# --- Спрос против предложения ------------------------------------------------------
+def offers(df: pd.DataFrame) -> pd.DataFrame:
+    """Только объявления о продаже."""
+    return df[df["listing_type"] == "offer"]
+
+
+def wanted(df: pd.DataFrame) -> pd.DataFrame:
+    """Только объявления покупателей («Koupím / Sháním / Hledám»), без перекупщиков."""
+    return df[df["listing_type"] == "demand"]
+
+
+def supply_demand_by_category(df: pd.DataFrame) -> pd.DataFrame:
+    """По категориям: сколько продают и сколько ищут, и цена продавцов против бюджета покупателей.
+
+    `demand_per_100_offers` — сколько объявлений «куплю» приходится на 100 объявлений «продаю»
+    в собранной выборке. `budget_to_price` < 1 — покупатели готовы платить меньше, чем просят.
+    """
+    cols = [
+        "category",
+        "offers",
+        "wanted",
+        "buyouts",
+        "demand_per_100_offers",
+        "median_offer_price",
+        "median_budget",
+        "budget_to_price",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for cat, g in df.groupby("category"):
+        o, w = offers(g), wanted(g)
+        op, wb = o["price_czk"].median(), w["price_czk"].median()
+        rows.append(
+            {
+                "category": cat,
+                "offers": len(o),
+                "wanted": len(w),
+                "buyouts": int((g["listing_type"] == "buyout").sum()),
+                "demand_per_100_offers": round(len(w) / len(o) * 100, 1) if len(o) else np.nan,
+                "median_offer_price": op,
+                "median_budget": wb,
+                "budget_to_price": round(wb / op, 2) if op and not np.isnan(wb) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _keyword_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Одна строка на пару (объявление, ключевое слово заголовка)."""
+    if df.empty:
+        return pd.DataFrame(columns=["id", "keyword", "listing_type", "vph", "price_czk", "is_active"])
+    base = df[["id", "title", "listing_type", "vph", "price_czk", "is_active"]].copy()
+    base["keyword"] = base["title"].map(tokenize)
+    return base.explode("keyword").dropna(subset=["keyword"])
+
+
+def supply_demand_by_keyword(df: pd.DataFrame, n: int = 15, min_wanted: int = 1) -> pd.DataFrame:
+    """Что ищут покупатели и сколько на это предложений.
+
+    `wanted` — объявлений «куплю» с этим словом, `offers` — объявлений «продаю»,
+    `wanted_per_offer` — напряжённость спроса (>1 — ищут больше, чем продают),
+    `offer_vph` — средний VPH предложений с этим словом (скрытый спрос по просмотрам).
+    """
+    rows = _keyword_rows(df[df["listing_type"].isin(["offer", "demand"])])
+    cols = [
+        "keyword",
+        "wanted",
+        "offers",
+        "wanted_per_offer",
+        "offer_vph",
+        "median_offer_price",
+        "median_budget",
+    ]
+    if rows.empty or not (rows["listing_type"] == "demand").any():
+        return pd.DataFrame(columns=cols)
+    w = rows[rows["listing_type"] == "demand"].groupby("keyword")
+    o = rows[rows["listing_type"] == "offer"].groupby("keyword")
+    out = pd.DataFrame(
+        {
+            "wanted": w["id"].nunique(),
+            "median_budget": w["price_czk"].median(),
+        }
+    ).join(
+        pd.DataFrame(
+            {
+                "offers": o["id"].nunique(),
+                "offer_vph": o["vph"].mean(),
+                "median_offer_price": o["price_czk"].median(),
+            }
+        ),
+        how="left",
+    )
+    out = out[out["wanted"] >= min_wanted].reset_index(names="keyword")
+    out["offers"] = out["offers"].fillna(0).astype(int)
+    out["wanted_per_offer"] = (out["wanted"] / out["offers"].replace(0, np.nan)).round(2)
+    out["offer_vph"] = out["offer_vph"].round(2)
+    out = out.sort_values(["wanted", "wanted_per_offer"], ascending=[False, False], na_position="first")
+    return out[cols].head(n).reset_index(drop=True)
+
+
+def market_counts_latest(db_path: Path | str | None = None) -> pd.DataFrame:
+    """Последний замер общего числа объявлений (python -m src.scraper --count) по рубрике и запросу."""
+    sql = """
+        SELECT category, kind, query, total, captured_at
+          FROM market_counts m
+         WHERE captured_at = (
+               SELECT MAX(captured_at) FROM market_counts x
+                WHERE x.category = m.category AND x.kind = m.kind
+                  AND COALESCE(x.query, '') = COALESCE(m.query, ''))
+         ORDER BY category, kind, query
+    """
+    with get_connection(db_path) as conn:
+        return pd.read_sql_query(sql, conn)
+
+
+def market_balance(counts: pd.DataFrame) -> pd.DataFrame:
+    """Сводка замеров: всего объявлений в рубрике и результатов поиска по словам спроса."""
+    cols = ["category", "offers_total", "demand_hits", "demand_per_1000"]
+    if counts.empty:
+        return pd.DataFrame(columns=cols)
+    offer = counts[counts["kind"] == "offer"].groupby("category")["total"].max()
+    # Запросы спроса пересекаются («koupím» и «sháním» в одном объявлении) — берём максимум, не сумму.
+    demand = counts[counts["kind"] == "demand"].groupby("category")["total"].max()
+    out = pd.DataFrame({"offers_total": offer, "demand_hits": demand}).rename_axis("category").reset_index()
+    out["demand_per_1000"] = (out["demand_hits"] / out["offers_total"] * 1000).round(1)
+    return out[cols]
+
+
 if __name__ == "__main__":
     data = load_listings()
     print(summary_metrics(data))
     print("\nТоп ключевых слов по VPH:\n", top_keywords_by_vph(data).to_string(index=False))
     print("\nОборачиваемость категорий:\n", category_turnover(data).to_string(index=False))
     print("\nЦена быстрых продаж:\n", price_of_fast_sellers(data).to_string(index=False))
+    print("\nСпрос и предложение по категориям:\n", supply_demand_by_category(data).to_string(index=False))
+    print("\nЧто ищут покупатели:\n", supply_demand_by_keyword(data).to_string(index=False))

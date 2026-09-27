@@ -24,7 +24,7 @@ def test_init_db_is_idempotent(tmp_path):
     with db.get_connection(path) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"listings", "listing_snapshots"} <= tables
-    assert db.table_counts(path) == {"listings": 0, "listing_snapshots": 0}
+    assert db.table_counts(path) == {"listings": 0, "listing_snapshots": 0, "market_counts": 0}
 
 
 def test_connection_is_closed_and_rolled_back(tmp_path):
@@ -101,3 +101,55 @@ def test_vph_formula():
     out = analytics.enrich(raw)
     assert out.loc[0, "vph"] == pytest.approx(10.0)
     assert pd.isna(out.loc[0, "lifetime_h"])
+
+
+def test_migration_adds_listing_type(tmp_path):
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:  # схема первой версии, без listing_type
+        conn.execute(
+            "CREATE TABLE listings (id TEXT PRIMARY KEY, category TEXT NOT NULL, query TEXT, "
+            "title TEXT NOT NULL, price_czk INTEGER, location TEXT, psc TEXT, url TEXT NOT NULL, "
+            "posted_at TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, last_checked TEXT, "
+            "removed_at TEXT, is_active INTEGER NOT NULL DEFAULT 1, views_initial INTEGER, "
+            "views_current INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO listings (id, category, title, url, first_seen, last_seen) "
+            "VALUES ('1', 'pc', 'RTX', 'u', '2026-01-01', '2026-01-01')"
+        )
+    conn.close()
+    db.init_db(path)
+    with db.get_connection(path) as conn:
+        assert conn.execute("SELECT listing_type FROM listings").fetchone()[0] == "offer"
+
+
+def test_supply_demand_on_seed(seeded):
+    path, _ = seeded
+    df = analytics.load_listings(path)
+    assert set(df["listing_type"]) == {"offer", "demand", "buyout"}
+
+    sd = analytics.supply_demand_by_category(df).set_index("category")
+    assert sd["wanted"].sum() == len(analytics.wanted(df)) == 8
+    assert sd.loc["auto", "buyouts"] == 1
+    assert (sd["demand_per_100_offers"] > 0).all()
+
+    kw = analytics.supply_demand_by_keyword(df).set_index("keyword")
+    assert kw.loc["iphone", "wanted"] == 2 and kw.loc["iphone", "offers"] >= 1
+    assert "koupím" not in kw.index and "sháním" not in kw.index
+    # метрики предложения не смешиваются со спросом
+    assert (analytics.offers(df)["listing_type"] == "offer").all()
+
+
+def test_market_balance(tmp_path):
+    path = db.init_db(tmp_path / "m.db")
+    with db.get_connection(path) as conn:
+        db.add_market_count(conn, "2026-09-01 10:00:00", "mobil", "offer", 5000)
+        db.add_market_count(conn, "2026-09-02 10:00:00", "mobil", "offer", 6000)
+        db.add_market_count(conn, "2026-09-02 10:00:00", "mobil", "demand", 120, "koupím")
+        db.add_market_count(conn, "2026-09-02 10:00:00", "mobil", "demand", 90, "sháním")
+    latest = analytics.market_counts_latest(path)
+    assert len(latest) == 3  # старый замер 5000 отброшен
+    bal = analytics.market_balance(latest).set_index("category")
+    assert bal.loc["mobil", "offers_total"] == 6000
+    assert bal.loc["mobil", "demand_hits"] == 120
+    assert bal.loc["mobil", "demand_per_1000"] == 20.0

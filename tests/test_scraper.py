@@ -57,7 +57,7 @@ REMOVED_HTML = "<html><body><h1>Inzerát byl vymazán</h1></body></html>"
     "text,expected",
     [
         ("12 500 Kč", 12500),
-        ("8 500 Kč", 8500),
+        ("8\u00a0500 Kč", 8500),
         ("Dohodou", None),
         ("V textu", None),
         ("Zdarma", 0),
@@ -172,3 +172,74 @@ def test_retry_on_429():
 def test_category_urls():
     assert scraper.category_page_url("pc", 0) == "https://pc.bazos.cz/"
     assert scraper.category_page_url("pc", 2) == "https://pc.bazos.cz/40/"
+
+
+@pytest.mark.parametrize(
+    "title,description,expected",
+    [
+        ("Koupím iPhone 13", "", "demand"),
+        ("SHÁNÍM Škoda Fabia", "", "demand"),
+        ("Hledám MacBook Air M1", "", "demand"),
+        ("- koupim RTX 3080 -", "", "demand"),
+        ("iPhone 13 do 8000", "Koupím iPhone v dobrém stavu", "demand"),
+        ("Vykoupím vaše auto", "", "buyout"),
+        ("Výkup mobilů za hotové", "", "buyout"),
+        ("Kotě hledá nový domov", "", "offer"),
+        ("Hledám nového majitele pro kolo", "", "offer"),
+        ("iPhone 13 128GB", "Prodám, koupím i protiúčtem", "offer"),
+        ("Prodám Škoda Octavia", "", "offer"),
+    ],
+)
+def test_classify_listing(title, description, expected):
+    assert scraper.classify_listing(title, description) == expected
+
+
+def test_parse_total_count():
+    html = "<div class='listainzerat'>Zobrazeno 1-20 inzerátů z 12\u00a0345</div>"
+    assert scraper.parse_total_count(html) == 12345
+    assert scraper.parse_total_count("<p>z 987 inzerátů</p>") == 987
+    assert scraper.parse_total_count("<p>nic</p>") is None
+
+
+DEMAND_LIST_HTML = """
+<html><body>
+<div class="inzeraty"><h2 class="nadpis"><a href="/inzerat/111/k.php">Koupím iPhone 13 do 8 000 Kč</a></h2>
+  <div class="inzeratycena"><b>Dohodou</b></div><div class="inzeratylok">Praha 110 00</div></div>
+<div class="inzeraty"><h2 class="nadpis"><a href="/inzerat/222/p.php">iPhone 13 128GB</a></h2>
+  <div class="popis">Prodám, koupím i protiúčet</div>
+  <div class="inzeratycena"><b>9 000 Kč</b></div><div class="inzeratylok">Brno 602 00</div></div>
+<p>Zobrazeno 1-20 inzerátů z 214</p>
+</body></html>
+"""
+
+
+def test_demand_listing_budget_and_type():
+    items = {
+        i["id"]: i for i in scraper.parse_listing_page(DEMAND_LIST_HTML, "mobil", "https://mobil.bazos.cz/")
+    }
+    assert items["111"]["listing_type"] == "demand" and items["111"]["price_czk"] == 8000
+    assert items["222"]["listing_type"] == "offer" and items["222"]["price_czk"] == 9000
+
+
+def test_scrape_demand_and_count_market(tmp_path):
+    db_path = tmp_path / "d.db"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("hledat"):
+            return httpx.Response(200, text=DEMAND_LIST_HTML)
+        return httpx.Response(200, text="<p>Zobrazeno 1-20 inzerátů z 50 000</p>")
+
+    with _client(handler) as client:
+        stats = scraper.scrape_demand(["mobil"], pages=1, db_path=db_path, client=client)
+        rows = scraper.count_market(["mobil", "pc"], db_path=db_path, client=client)
+    assert stats["new"] == 2  # одни и те же объявления по 3 запросам не дублируются
+    with db.get_connection(db_path) as conn:
+        types = dict(conn.execute("SELECT id, listing_type FROM listings").fetchall())
+        kinds = {r[0] for r in conn.execute("SELECT DISTINCT kind FROM market_counts")}
+    assert types == {"111": "demand", "222": "offer"}
+    assert kinds == {"offer", "demand"}
+    assert {(r["category"], r["kind"], r["total"]) for r in rows if r["query"] is None} == {
+        ("mobil", "offer", 50000),
+        ("pc", "offer", 50000),
+    }
+    assert all(r["total"] == 214 for r in rows if r["query"])

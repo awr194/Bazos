@@ -4,6 +4,8 @@
     python -m src.scraper --categories mobil pc --pages 2          # сбор новых объявлений
     python -m src.scraper --query "iphone 13" --categories mobil   # сбор по поисковому запросу
     python -m src.scraper --update                                 # перепроверка активных
+    python -m src.scraper --demand --pages 3                       # объявления «Koupím/Sháním»
+    python -m src.scraper --count                                  # общий объём рынка
     python -m src.scraper --seed-sample                            # демо-данные для дашборда
 
 Парсинг намеренно опирается на структуру страницы (ссылки вида /inzerat/<id>/ и
@@ -34,12 +36,26 @@ log = logging.getLogger("bazos.scraper")
 
 # --- Регулярные выражения ----------------------------------------------------
 LISTING_HREF_RE = re.compile(r"/inzerat/(\d+)/")
-VIEWS_DETAIL_RE = re.compile(r"Vid[ěe]lo\s*:?\s*([\d\s ]+?)\s*(?:lid|osob)", re.IGNORECASE)
-VIEWS_LIST_RE = re.compile(r"(\d[\d\s ]*)\s*x\b")
-PRICE_RE = re.compile(r"(\d[\d\s .]*)\s*K[čc]", re.IGNORECASE)
+VIEWS_DETAIL_RE = re.compile(r"Vid[ěe]lo\s*:?\s*([\d\s\u00a0]+?)\s*(?:lid|osob)", re.IGNORECASE)
+VIEWS_LIST_RE = re.compile(r"(\d[\d\s\u00a0]*)\s*x\b")
+PRICE_RE = re.compile(r"(\d[\d\s\u00a0.]*)\s*K[čc]", re.IGNORECASE)
 DATE_RE = re.compile(r"\[\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})\s*\]")
 PSC_RE = re.compile(r"\b(\d{3})\s?(\d{2})\b")
-WS_RE = re.compile(r"[\s ]+")
+WS_RE = re.compile(r"[\s\u00a0]+")
+# «Zobrazeno 1-20 inzerátů z 12 345» — общее число объявлений в выдаче.
+TOTAL_RE = re.compile(r"Zobrazeno\s*\d+\s*[-–]\s*\d+\s*inzer\w*\s*z\s*(\d[\d\s\u00a0]*)", re.IGNORECASE)
+TOTAL_FALLBACK_RE = re.compile(r"\bz\s+(\d[\d\s\u00a0]*)\s*inzer", re.IGNORECASE)
+
+# Объявления-«спрос»: покупатель сам пишет, что ищет. Проверяем начало заголовка/описания.
+DEMAND_RE = re.compile(
+    r"^\W*(?:koupím|koupim|koupíme|koupime|sháním|shanim|sháníme|hledám|hledam|hledáme|"
+    r"poptávám|poptavam|poptávka|poptavka|chci koupit|zájem o|mám zájem)\b",
+    re.IGNORECASE,
+)
+# Перекупщики («Vykoupím vaše auto», «Výkup mobilů») — отдельный тип, чтобы не искажать спрос.
+BUYOUT_RE = re.compile(r"^\W*(?:vykoupím|vykoupim|vykoupíme|vykoupime|výkup|vykup)\b", re.IGNORECASE)
+# «Hledám nového majitele» — это продажа, а не поиск.
+FALSE_DEMAND_RE = re.compile(r"nov(?:ého|eho|ý|y)\s+(?:majitele|páníčka|domov)", re.IGNORECASE)
 
 
 @dataclass
@@ -112,6 +128,27 @@ def parse_location(text: str | None) -> tuple[str | None, str | None]:
     return city, psc
 
 
+def classify_listing(title: str | None, description: str | None = None) -> str:
+    """offer — продаю, demand — «Koupím/Sháním/Hledám», buyout — перекупщики («Vykoupím»)."""
+    t = clean_text(title)
+    if BUYOUT_RE.search(t):
+        return "buyout"
+    if DEMAND_RE.search(t) and not FALSE_DEMAND_RE.search(t):
+        return "demand"
+    # Заголовок без глагола («iPhone 13 do 8000») — смотрим начало описания.
+    d = clean_text(description)[:80]
+    if d and DEMAND_RE.search(d) and not FALSE_DEMAND_RE.search(d):
+        return "demand"
+    return "offer"
+
+
+def parse_total_count(html: str) -> int | None:
+    """Общее число объявлений в рубрике/выдаче поиска («… inzerátů z 12 345»)."""
+    text = clean_text(HTMLParser(html).text(separator=" "))
+    m = TOTAL_RE.search(text) or TOTAL_FALLBACK_RE.search(text)
+    return parse_int(m.group(1)) if m else None
+
+
 def _node_text(node: Node | None) -> str:
     return clean_text(node.text(separator=" ")) if node is not None else ""
 
@@ -178,6 +215,10 @@ def parse_listing_page(
         if psc is None:
             _, psc = parse_location(scan_text)
 
+        listing_type = classify_listing(title, _node_text(popis))
+        if price is None and listing_type == "demand":
+            price = parse_price(title)  # бюджет покупателя: «Koupím iPhone 13 do 8 000 Kč»
+
         views = None
         view_node = _find_by_class_fragment(card, ("view",))
         if view_node is not None:
@@ -190,6 +231,7 @@ def parse_listing_page(
                 "category": category,
                 "query": query,
                 "title": title,
+                "listing_type": listing_type,
                 "price_czk": price,
                 "location": location,
                 "psc": psc,
@@ -314,6 +356,12 @@ def fetch_detail(client: BazosClient, url: str) -> DetailResult:
     return parse_detail_page(resp.text)
 
 
+def market_kind(query: str | None) -> str:
+    if not query:
+        return "offer"
+    return "demand" if query in config.DEMAND_QUERIES else "search"
+
+
 # --- Сценарии ------------------------------------------------------------------
 def scrape(
     categories: Iterable[str],
@@ -339,6 +387,11 @@ def scrape(
                     log.error("Не удалось загрузить %s", url)
                     break
                 items = parse_listing_page(resp.text, category, str(resp.url), query)
+                if page == 0:
+                    total = parse_total_count(resp.text)
+                    if total is not None:
+                        with db.get_connection(db_path) as conn:
+                            db.add_market_count(conn, db.utcnow(), category, market_kind(query), total, query)
                 stats["pages"] += 1
                 stats["found"] += len(items)
                 log.info("%s стр.%d: %d объявлений", category, page + 1, len(items))
@@ -363,6 +416,62 @@ def scrape(
         if own_client:
             client.close()
     return stats
+
+
+def scrape_demand(
+    categories: Iterable[str],
+    pages: int = 1,
+    queries: Iterable[str] = config.DEMAND_QUERIES,
+    fetch_details: bool = False,
+    detail_limit: int | None = None,
+    db_path: Path | str | None = None,
+    client: BazosClient | None = None,
+) -> dict[str, int]:
+    """Собирает объявления «Koupím / Sháním / Hledám» — то, что люди сами ищут."""
+    total = {"pages": 0, "found": 0, "new": 0, "snapshots": 0}
+    own_client = client is None
+    client = client or BazosClient()
+    try:
+        for q in queries:
+            stats = scrape(categories, pages, q, fetch_details, detail_limit, db_path, client)
+            for k in total:
+                total[k] += stats[k]
+    finally:
+        if own_client:
+            client.close()
+    return total
+
+
+def count_market(
+    categories: Iterable[str],
+    queries: Iterable[str] = config.DEMAND_QUERIES,
+    db_path: Path | str | None = None,
+    client: BazosClient | None = None,
+) -> list[dict[str, Any]]:
+    """Только считает объём рынка: сколько всего объявлений в рубрике и по запросам спроса.
+
+    1 запрос на рубрику + 1 на каждый запрос спроса; сами объявления не сохраняются.
+    """
+    db.init_db(db_path)
+    rows: list[dict[str, Any]] = []
+    own_client = client is None
+    client = client or BazosClient()
+    try:
+        for category in categories:
+            for q in [None, *queries]:
+                resp = client.get(config.CATEGORY_URLS[category], params=search_params(q) if q else None)
+                ok = resp is not None and resp.status_code == 200
+                total = parse_total_count(resp.text) if ok else None
+                rows.append({"category": category, "kind": market_kind(q), "query": q, "total": total})
+                if total is not None:
+                    with db.get_connection(db_path) as conn:
+                        db.add_market_count(conn, db.utcnow(), category, market_kind(q), total, q)
+                else:
+                    log.warning("Не удалось определить общее число для %s / %s", category, q or "—")
+    finally:
+        if own_client:
+            client.close()
+    return rows
 
 
 def update_active(
@@ -477,6 +586,18 @@ SAMPLE_QUERIES = {
     "rtx": "rtx",
     "samsung": "samsung",
 }
+# Объявления покупателей: (категория, заголовок, бюджет CZK или None, «горячесть», тип).
+SAMPLE_WANTED: list[tuple[str, str, int | None, int, str]] = [
+    ("mobil", "Koupím iPhone 13 do 8 000 Kč", 8000, 7, "demand"),
+    ("mobil", "Koupím iPhone 14 Pro, i s vadou", None, 6, "demand"),
+    ("mobil", "Sháním Samsung Galaxy S23", 12000, 4, "demand"),
+    ("pc", "Sháním MacBook Air M1, rozumná cena", 11000, 6, "demand"),
+    ("pc", "Koupím RTX 3070 / RTX 3080", 7000, 5, "demand"),
+    ("elektro", "Hledám Dyson V11 do 6 000 Kč", 6000, 4, "demand"),
+    ("auto", "Koupím Škoda Octavia III, do 200 000 Kč", 200000, 6, "demand"),
+    ("auto", "Sháním Škoda Fabia II pro dceru", 60000, 5, "demand"),
+    ("auto", "Vykoupím vaše auto – platba ihned", None, 3, "buyout"),
+]
 SAMPLE_ID_BASE = 900_000_000  # диапазон, не пересекающийся с реальными ID
 
 
@@ -485,55 +606,56 @@ def _slug(text: str) -> str:
 
 
 def seed_sample(db_path: Path | str | None = None, seed: int = 42) -> int:
-    """Создаёт ~40 правдоподобных объявлений со снимками просмотров за последние дни."""
+    """Создаёт 50 правдоподобных объявлений (41 продажа + 9 «куплю») со снимками просмотров."""
     rng = random.Random(seed)
     db.init_db(db_path)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     count = 0
     with db.get_connection(db_path) as conn:
         conn.execute("DELETE FROM listings WHERE CAST(id AS INTEGER) >= ?", (SAMPLE_ID_BASE,))
-        for category, items in SAMPLE_ITEMS.items():
-            for title, price, heat in items:
-                count += 1
-                listing_id = str(SAMPLE_ID_BASE + count)
-                city, psc = rng.choice(SAMPLE_LOCATIONS)
-                first_seen = now - timedelta(hours=rng.uniform(6, 120))
-                posted = first_seen - timedelta(hours=rng.uniform(0, 30))
-                query = next((q for k, q in SAMPLE_QUERIES.items() if k in title.lower()), None)
-                vph = max(0.3, rng.gauss(heat * 2.2, heat * 0.5))
-                views0 = rng.randint(5, 40 + heat * 15)
-                # Горячие объявления уходят быстрее: время жизни ~ 4–120 ч.
-                lifetime_h = rng.uniform(4, 22) + (10 - heat) * rng.uniform(3, 11)
-                removed = first_seen + timedelta(hours=lifetime_h)
-                is_active = removed > now
-                end = now if is_active else removed
-                item = {
-                    "id": listing_id,
-                    "category": category,
-                    "query": query,
-                    "title": title,
-                    "price_czk": price,
-                    "location": city,
-                    "psc": psc,
-                    "url": f"{config.CATEGORY_URLS[category]}inzerat/{listing_id}/{_slug(title)}.php",
-                    "posted_at": posted.date().isoformat(),
-                }
-                db.upsert_listing(conn, item, db.fmt_ts(first_seen))
-                # Снимки каждые ~3–8 часов между first_seen и end.
-                t = last_snap = first_seen
-                views = views0
-                while t <= end:
-                    db.add_snapshot(conn, listing_id, db.fmt_ts(t), int(views), price)
-                    last_snap = t
-                    step = rng.uniform(3, 8)
-                    t += timedelta(hours=step)
-                    views += vph * step * rng.uniform(0.7, 1.3)
-                conn.execute(
-                    "UPDATE listings SET last_seen = ?, last_checked = ? WHERE id = ?",
-                    (db.fmt_ts(last_snap), db.fmt_ts(last_snap), listing_id),
-                )
-                if not is_active:
-                    db.mark_inactive(conn, listing_id, db.fmt_ts(removed))
+        records = [(c, t, p, h, "offer") for c, items in SAMPLE_ITEMS.items() for t, p, h in items]
+        for category, title, price, heat, listing_type in records + SAMPLE_WANTED:
+            count += 1
+            listing_id = str(SAMPLE_ID_BASE + count)
+            city, psc = rng.choice(SAMPLE_LOCATIONS)
+            first_seen = now - timedelta(hours=rng.uniform(6, 120))
+            posted = first_seen - timedelta(hours=rng.uniform(0, 30))
+            query = next((q for k, q in SAMPLE_QUERIES.items() if k in title.lower()), None)
+            vph = max(0.3, rng.gauss(heat * 2.2, heat * 0.5))
+            views0 = rng.randint(5, 40 + heat * 15)
+            # Горячие объявления уходят быстрее: время жизни ~ 4–120 ч.
+            lifetime_h = rng.uniform(4, 22) + (10 - heat) * rng.uniform(3, 11)
+            removed = first_seen + timedelta(hours=lifetime_h)
+            is_active = removed > now
+            end = now if is_active else removed
+            item = {
+                "id": listing_id,
+                "category": category,
+                "query": query,
+                "title": title,
+                "listing_type": listing_type,
+                "price_czk": price,
+                "location": city,
+                "psc": psc,
+                "url": f"{config.CATEGORY_URLS[category]}inzerat/{listing_id}/{_slug(title)}.php",
+                "posted_at": posted.date().isoformat(),
+            }
+            db.upsert_listing(conn, item, db.fmt_ts(first_seen))
+            # Снимки каждые ~3–8 часов между first_seen и end.
+            t = last_snap = first_seen
+            views = views0
+            while t <= end:
+                db.add_snapshot(conn, listing_id, db.fmt_ts(t), int(views), price)
+                last_snap = t
+                step = rng.uniform(3, 8)
+                t += timedelta(hours=step)
+                views += vph * step * rng.uniform(0.7, 1.3)
+            conn.execute(
+                "UPDATE listings SET last_seen = ?, last_checked = ? WHERE id = ?",
+                (db.fmt_ts(last_snap), db.fmt_ts(last_snap), listing_id),
+            )
+            if not is_active:
+                db.mark_inactive(conn, listing_id, db.fmt_ts(removed))
     return count
 
 
@@ -568,7 +690,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--limit", type=int, default=None, help="лимит объявлений для --update")
     p.add_argument(
-        "--seed-sample", action="store_true", help="заполнить базу демо-данными (~40 объявлений) и выйти"
+        "--demand",
+        action="store_true",
+        help="собрать объявления покупателей («koupím», «sháním», «hledám») — что люди ищут",
+    )
+    p.add_argument(
+        "--count",
+        action="store_true",
+        help="только посчитать общий объём рынка по рубрикам и запросам спроса (без сохранения объявлений)",
+    )
+    p.add_argument(
+        "--seed-sample", action="store_true", help="заполнить базу демо-данными (50 объявлений) и выйти"
     )
     p.add_argument("--init-db", action="store_true", help="только создать таблицы и выйти")
     p.add_argument("--db", type=Path, default=None, help=f"путь к SQLite (по умолчанию {config.DB_PATH})")
@@ -593,6 +725,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.update:
         stats = update_active(args.categories, args.limit, args.db)
         print(f"Проверка завершена: {stats}")
+        return 0
+    if args.count:
+        for row in count_market(args.categories, db_path=args.db):
+            total = "н/д" if row["total"] is None else f"{row['total']:,}".replace(",", " ")
+            print(f"{row['category']:<8} {row['kind']:<7} {row['query'] or '(вся рубрика)':<14} {total}")
+        return 0
+    if args.demand:
+        stats = scrape_demand(
+            args.categories,
+            args.pages,
+            fetch_details=not args.no_details,
+            detail_limit=args.detail_limit,
+            db_path=args.db,
+        )
+        print(f"Сбор спроса завершён: {stats}")
         return 0
     stats = scrape(
         args.categories,
