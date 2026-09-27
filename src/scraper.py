@@ -6,6 +6,8 @@
     python -m src.scraper --update                                 # перепроверка активных
     python -m src.scraper --demand --pages 3                       # объявления «Koupím/Sháním»
     python -m src.scraper --count                                  # общий объём рынка
+    python -m src.scraper --discover                               # справочник рубрик и подкатегорий
+    python -m src.scraper --by-subcategory --no-details --pages 1  # обход всех подкатегорий
     python -m src.scraper --seed-sample                            # демо-данные для дашборда
 
 Парсинг намеренно опирается на структуру страницы (ссылки вида /inzerat/<id>/ и
@@ -25,7 +27,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from selectolax.parser import HTMLParser, Node
@@ -140,6 +142,47 @@ def classify_listing(title: str | None, description: str | None = None) -> str:
     if d and DEMAND_RE.search(d) and not FALSE_DEMAND_RE.search(d):
         return "demand"
     return "offer"
+
+
+RUBRIC_HREF_RE = re.compile(r"^https?://([a-z0-9-]+)\.bazos\.cz/?$", re.IGNORECASE)
+SUBCATEGORY_PATH_RE = re.compile(r"^/([a-z0-9][a-z0-9-]*)/?$")
+# Служебные разделы, которые выглядят как подкатегории, но ими не являются.
+NOT_SUBCATEGORIES = frozenset({"inzerat", "search", "hledat", "pridat", "moje", "kontakt", "napoveda"})
+
+
+def parse_rubrics(html: str) -> dict[str, str]:
+    """Рубрики с главной www.bazos.cz: {код поддомена: название}."""
+    rubrics: dict[str, str] = {}
+    for a in HTMLParser(html).css("a[href]"):
+        m = RUBRIC_HREF_RE.match((a.attributes.get("href") or "").strip())
+        name = _node_text(a)
+        if m and m.group(1).lower() != "www" and name:
+            rubrics.setdefault(m.group(1).lower(), name)
+    return rubrics
+
+
+def parse_subcategories(html: str, category: str) -> dict[str, str]:
+    """Подкатегории со страницы рубрики: {slug: название}, например {"apple": "Apple"}.
+
+    Ищем ссылки на пути из одного сегмента (/apple/ или https://mobil.bazos.cz/apple/),
+    исключая пагинацию (/20/), объявления и служебные страницы (*.php).
+    """
+    host = f"{category}.bazos.cz"
+    subs: dict[str, str] = {}
+    for a in HTMLParser(html).css("a[href]"):
+        href = (a.attributes.get("href") or "").strip()
+        parsed = urlparse(href)
+        if parsed.netloc and parsed.netloc.lower() != host:
+            continue
+        m = SUBCATEGORY_PATH_RE.match(parsed.path or "")
+        name = _node_text(a)
+        if not m or not name or parsed.query:
+            continue
+        slug = m.group(1).lower()
+        if slug.isdigit() or slug in NOT_SUBCATEGORIES:
+            continue
+        subs.setdefault(slug, name)
+    return subs
 
 
 def parse_total_count(html: str) -> int | None:
@@ -324,8 +367,10 @@ class BazosClient:
         return None
 
 
-def category_page_url(category: str, page: int) -> str:
-    base = config.CATEGORY_URLS[category]
+def category_page_url(category: str, page: int, subcategory: str | None = None) -> str:
+    base = config.category_url(category)
+    if subcategory:
+        base = urljoin(base, f"{subcategory}/")
     offset = page * config.LISTINGS_PER_PAGE
     return base if offset == 0 else urljoin(base, f"{offset}/")
 
@@ -371,8 +416,12 @@ def scrape(
     detail_limit: int | None = None,
     db_path: Path | str | None = None,
     client: BazosClient | None = None,
+    subcategory: str | None = None,
 ) -> dict[str, int]:
-    """Собирает объявления с первых `pages` страниц каждой категории и делает снимки просмотров."""
+    """Собирает объявления с первых `pages` страниц каждой категории и делает снимки просмотров.
+
+    `subcategory` — обходить не всю рубрику, а её подкатегорию (объявления получат этот тег).
+    """
     db.init_db(db_path)
     stats = {"pages": 0, "found": 0, "new": 0, "snapshots": 0}
     own_client = client is None
@@ -381,20 +430,32 @@ def scrape(
         for category in categories:
             details_done = 0
             for page in range(pages):
-                url = category_page_url(category, page)
+                url = category_page_url(category, page, subcategory)
                 resp = client.get(url, params=search_params(query) if query else None)
                 if resp is None or resp.status_code != 200:
                     log.error("Не удалось загрузить %s", url)
                     break
                 items = parse_listing_page(resp.text, category, str(resp.url), query)
+                for item in items:
+                    item["subcategory"] = subcategory
                 if page == 0:
                     total = parse_total_count(resp.text)
                     if total is not None:
+                        # Для подкатегории сохраняем отдельный вид замера, чтобы не перетереть итог рубрики.
+                        kind, q = ("subcategory", subcategory) if subcategory else (market_kind(query), query)
+                        if subcategory and query:
+                            kind, q = "search", f"{subcategory}:{query}"
                         with db.get_connection(db_path) as conn:
-                            db.add_market_count(conn, db.utcnow(), category, market_kind(query), total, query)
+                            db.add_market_count(conn, db.utcnow(), category, kind, total, q)
                 stats["pages"] += 1
                 stats["found"] += len(items)
-                log.info("%s стр.%d: %d объявлений", category, page + 1, len(items))
+                log.info(
+                    "%s%s стр.%d: %d объявлений",
+                    category,
+                    f"/{subcategory}" if subcategory else "",
+                    page + 1,
+                    len(items),
+                )
                 if not items:
                     break
                 for item in items:
@@ -416,6 +477,77 @@ def scrape(
         if own_client:
             client.close()
     return stats
+
+
+def discover(
+    categories: Iterable[str] | None = None,
+    db_path: Path | str | None = None,
+    client: BazosClient | None = None,
+) -> dict[str, Any]:
+    """Обновляет справочник: рубрики с главной www.bazos.cz и подкатегории каждой рубрики.
+
+    Если `categories` не заданы — берутся все рубрики, найденные на главной, плюс известные из config.
+    """
+    db.init_db(db_path)
+    own_client = client is None
+    client = client or BazosClient()
+    result: dict[str, Any] = {"rubrics": {}, "new_rubrics": [], "subcategories": {}}
+    try:
+        resp = client.get(config.HOMEPAGE_URL)
+        rubrics = parse_rubrics(resp.text) if resp is not None and resp.status_code == 200 else {}
+        result["rubrics"] = rubrics
+        result["new_rubrics"] = sorted(set(rubrics) - set(config.CATEGORY_LABELS))
+        targets = list(categories) if categories else sorted(set(rubrics) | set(config.CATEGORY_LABELS))
+        now = db.utcnow()
+        with db.get_connection(db_path) as conn:
+            for code in targets:
+                db.upsert_taxonomy(conn, code, "", rubrics.get(code), config.category_url(code), now)
+        for code in targets:
+            resp = client.get(config.category_url(code))
+            if resp is None or resp.status_code != 200:
+                log.warning("Не удалось открыть рубрику %s", code)
+                continue
+            subs = parse_subcategories(resp.text, code)
+            result["subcategories"][code] = subs
+            with db.get_connection(db_path) as conn:
+                for slug, name in subs.items():
+                    url = urljoin(config.category_url(code), f"{slug}/")
+                    db.upsert_taxonomy(conn, code, slug, name, url, now)
+            log.info("%s: %d подкатегорий", code, len(subs))
+    finally:
+        if own_client:
+            client.close()
+    return result
+
+
+def scrape_by_subcategory(
+    categories: Iterable[str],
+    pages: int = 1,
+    query: str | None = None,
+    fetch_details: bool = False,
+    detail_limit: int | None = None,
+    db_path: Path | str | None = None,
+    client: BazosClient | None = None,
+) -> dict[str, int]:
+    """Обходит каждую известную подкатегорию (сначала запустите --discover) — объявления получают тег."""
+    rows = [r for r in db.list_taxonomy(db_path, categories) if r["subcategory"]]
+    total = {"subcategories": len(rows), "pages": 0, "found": 0, "new": 0, "snapshots": 0}
+    if not rows:
+        log.warning("Подкатегории не найдены — сначала выполните: python -m src.scraper --discover")
+        return total
+    own_client = client is None
+    client = client or BazosClient()
+    try:
+        for r in rows:
+            stats = scrape(
+                [r["category"]], pages, query, fetch_details, detail_limit, db_path, client, r["subcategory"]
+            )
+            for k in ("pages", "found", "new", "snapshots"):
+                total[k] += stats[k]
+    finally:
+        if own_client:
+            client.close()
+    return total
 
 
 def scrape_demand(
@@ -459,7 +591,7 @@ def count_market(
     try:
         for category in categories:
             for q in [None, *queries]:
-                resp = client.get(config.CATEGORY_URLS[category], params=search_params(q) if q else None)
+                resp = client.get(config.category_url(category), params=search_params(q) if q else None)
                 ok = resp is not None and resp.status_code == 200
                 total = parse_total_count(resp.text) if ok else None
                 rows.append({"category": category, "kind": market_kind(q), "query": q, "total": total})
@@ -515,57 +647,57 @@ def update_active(
 
 
 # --- Демо-данные ---------------------------------------------------------------
-SAMPLE_ITEMS: dict[str, list[tuple[str, int, int]]] = {
-    # (заголовок, цена CZK, «горячесть» 1..10 — влияет на VPH и скорость продажи)
+SAMPLE_ITEMS: dict[str, list[tuple[str, int, int, str]]] = {
+    # (заголовок, цена CZK, «горячесть» 1..10 — влияет на VPH и скорость продажи, подкатегория)
     "mobil": [
-        ("iPhone 13 128GB, baterie 89 %", 8900, 9),
-        ("iPhone 14 Pro 256GB fialový", 17500, 8),
-        ("Samsung Galaxy S23 Ultra 512GB", 16900, 7),
-        ("Xiaomi Redmi Note 12 Pro", 3900, 5),
-        ("Google Pixel 8 128GB záruka", 11500, 6),
-        ("iPhone 11 64GB černý", 4990, 9),
-        ("Samsung Galaxy A54 5G", 4500, 4),
-        ("Motorola Edge 40 Neo", 5200, 3),
-        ("iPhone 15 128GB nový, nerozbalený", 18900, 10),
-        ("Nokia 3310 retro", 450, 2),
-        ("OnePlus 11 16/256GB", 9900, 5),
+        ("iPhone 13 128GB, baterie 89 %", 8900, 9, "apple"),
+        ("iPhone 14 Pro 256GB fialový", 17500, 8, "apple"),
+        ("Samsung Galaxy S23 Ultra 512GB", 16900, 7, "samsung"),
+        ("Xiaomi Redmi Note 12 Pro", 3900, 5, "xiaomi"),
+        ("Google Pixel 8 128GB záruka", 11500, 6, "google"),
+        ("iPhone 11 64GB černý", 4990, 9, "apple"),
+        ("Samsung Galaxy A54 5G", 4500, 4, "samsung"),
+        ("iPhone 15 128GB nový, nerozbalený", 18900, 10, "apple"),
+        ("OnePlus 11 16/256GB", 9900, 5, "oneplus"),
     ],
     "pc": [
-        ("Herní PC RTX 3070, Ryzen 5 5600X", 17900, 8),
-        ("MacBook Air M1 8/256GB", 13500, 9),
-        ("Lenovo ThinkPad T480 i5 16GB", 5900, 7),
-        ("Grafická karta RTX 4060 Ti", 9800, 8),
-        ('Monitor Dell 27" 144Hz', 3900, 5),
-        ("MacBook Pro 14 M2 Pro", 38900, 6),
-        ("Mechanická klávesnice Keychron K2", 1500, 4),
-        ("SSD Samsung 990 Pro 2TB", 3200, 6),
-        ("HP EliteBook 840 G5", 4990, 3),
-        ("PS5 Digital Edition + 2 ovladače", 8500, 10),
+        ("Herní PC RTX 3070, Ryzen 5 5600X", 17900, 8, "pocitace"),
+        ("MacBook Air M1 8/256GB", 13500, 9, "notebooky"),
+        ("Lenovo ThinkPad T480 i5 16GB", 5900, 7, "notebooky"),
+        ("Grafická karta RTX 4060 Ti", 9800, 8, "komponenty"),
+        ('Monitor Dell 27" 144Hz', 3900, 5, "monitory"),
+        ("MacBook Pro 14 M2 Pro", 38900, 6, "notebooky"),
+        ("SSD Samsung 990 Pro 2TB", 3200, 6, "komponenty"),
+        ("PS5 Digital Edition + 2 ovladače", 8500, 10, "konzole"),
     ],
     "elektro": [
-        ("Robotický vysavač Roborock S7", 6500, 7),
-        ("Dyson V11 Absolute", 7900, 8),
-        ('Televize LG OLED 55" C1', 16900, 6),
-        ("Kávovar DeLonghi Magnifica S", 4200, 7),
-        ("AirPods Pro 2. generace", 3900, 9),
-        ("Sony WH-1000XM4 sluchátka", 3500, 8),
-        ("Mikrovlnná trouba Whirlpool", 900, 2),
-        ("Pračka Bosch Serie 6, 8 kg", 6900, 5),
-        ("Apple Watch Series 8 45mm", 6200, 7),
-        ("GoPro Hero 11 Black", 6800, 4),
+        ("Robotický vysavač Roborock S7", 6500, 7, "vysavace"),
+        ("Dyson V11 Absolute", 7900, 8, "vysavace"),
+        ('Televize LG OLED 55" C1', 16900, 6, "televize"),
+        ("Kávovar DeLonghi Magnifica S", 4200, 7, "kuchyne"),
+        ("AirPods Pro 2. generace", 3900, 9, "audio"),
+        ("Sony WH-1000XM4 sluchátka", 3500, 8, "audio"),
+        ("Pračka Bosch Serie 6, 8 kg", 6900, 5, "pracky"),
+        ("Apple Watch Series 8 45mm", 6200, 7, "hodinky"),
     ],
     "auto": [
-        ("Škoda Octavia III 2.0 TDI 2017", 239000, 8),
-        ("VW Golf VII 1.4 TSI 2016", 219000, 7),
-        ("Škoda Fabia II 1.2 HTP 2010", 69000, 9),
-        ("Ford Focus 1.6 TDCi kombi 2012", 89000, 5),
-        ("BMW 320d E90 2009", 139000, 4),
-        ("Hyundai i30 1.4 CVVT 2014", 149000, 6),
-        ("Toyota Yaris 1.33 2011", 99000, 7),
-        ("Škoda Superb II 2.0 TDI DSG", 289000, 5),
-        ("Dacia Duster 1.6 4x4 2015", 175000, 6),
-        ("Zimní pneu 205/55 R16 sada", 3500, 8),
+        ("Škoda Octavia III 2.0 TDI 2017", 239000, 8, "skoda"),
+        ("VW Golf VII 1.4 TSI 2016", 219000, 7, "volkswagen"),
+        ("Škoda Fabia II 1.2 HTP 2010", 69000, 9, "skoda"),
+        ("Ford Focus 1.6 TDCi kombi 2012", 89000, 5, "ford"),
+        ("Toyota Yaris 1.33 2011", 99000, 7, "toyota"),
+        ("Škoda Superb II 2.0 TDI DSG", 289000, 5, "skoda"),
+        ("Dacia Duster 1.6 4x4 2015", 175000, 6, "dacia"),
+        ("Zimní pneu 205/55 R16 sada", 3500, 8, "pneumatiky"),
     ],
+    "motorky": [("Yamaha MT-07 2019, 18 000 km", 159000, 7, "yamaha")],
+    "sport": [("Horské kolo Specialized Rockhopper 29", 14500, 8, "cyklistika")],
+    "nabytek": [("Rohová sedačka rozkládací", 6500, 5, "sedaci-soupravy")],
+    "dum": [("Aku vrtačka Makita 18V + 2 baterie", 3900, 8, "naradi")],
+    "deti": [("Kočárek Cybex Priam 3v1", 12900, 7, "kocarky")],
+    "hudba": [("Elektrická kytara Fender Stratocaster", 16500, 5, "kytary")],
+    "foto": [("Sony A7 III tělo, 25 000 cvaků", 32000, 6, "fotoaparaty")],
+    "zvirata": [("Akvárium 240 l s příslušenstvím", 4500, 3, "akvaristika")],
 }
 SAMPLE_LOCATIONS = [
     ("Praha", "110 00"),
@@ -586,17 +718,17 @@ SAMPLE_QUERIES = {
     "rtx": "rtx",
     "samsung": "samsung",
 }
-# Объявления покупателей: (категория, заголовок, бюджет CZK или None, «горячесть», тип).
-SAMPLE_WANTED: list[tuple[str, str, int | None, int, str]] = [
-    ("mobil", "Koupím iPhone 13 do 8 000 Kč", 8000, 7, "demand"),
-    ("mobil", "Koupím iPhone 14 Pro, i s vadou", None, 6, "demand"),
-    ("mobil", "Sháním Samsung Galaxy S23", 12000, 4, "demand"),
-    ("pc", "Sháním MacBook Air M1, rozumná cena", 11000, 6, "demand"),
-    ("pc", "Koupím RTX 3070 / RTX 3080", 7000, 5, "demand"),
-    ("elektro", "Hledám Dyson V11 do 6 000 Kč", 6000, 4, "demand"),
-    ("auto", "Koupím Škoda Octavia III, do 200 000 Kč", 200000, 6, "demand"),
-    ("auto", "Sháním Škoda Fabia II pro dceru", 60000, 5, "demand"),
-    ("auto", "Vykoupím vaše auto – platba ihned", None, 3, "buyout"),
+# Объявления покупателей: (категория, заголовок, бюджет CZK или None, «горячесть», тип, подкатегория).
+SAMPLE_WANTED: list[tuple[str, str, int | None, int, str, str | None]] = [
+    ("mobil", "Koupím iPhone 13 do 8 000 Kč", 8000, 7, "demand", "apple"),
+    ("mobil", "Koupím iPhone 14 Pro, i s vadou", None, 6, "demand", "apple"),
+    ("mobil", "Sháním Samsung Galaxy S23", 12000, 4, "demand", "samsung"),
+    ("pc", "Sháním MacBook Air M1, rozumná cena", 11000, 6, "demand", "notebooky"),
+    ("pc", "Koupím RTX 3070 / RTX 3080", 7000, 5, "demand", "komponenty"),
+    ("elektro", "Hledám Dyson V11 do 6 000 Kč", 6000, 4, "demand", "vysavace"),
+    ("auto", "Koupím Škoda Octavia III, do 200 000 Kč", 200000, 6, "demand", "skoda"),
+    ("auto", "Sháním Škoda Fabia II pro dceru", 60000, 5, "demand", "skoda"),
+    ("auto", "Vykoupím vaše auto – platba ihned", None, 3, "buyout", None),
 ]
 SAMPLE_ID_BASE = 900_000_000  # диапазон, не пересекающийся с реальными ID
 
@@ -613,8 +745,8 @@ def seed_sample(db_path: Path | str | None = None, seed: int = 42) -> int:
     count = 0
     with db.get_connection(db_path) as conn:
         conn.execute("DELETE FROM listings WHERE CAST(id AS INTEGER) >= ?", (SAMPLE_ID_BASE,))
-        records = [(c, t, p, h, "offer") for c, items in SAMPLE_ITEMS.items() for t, p, h in items]
-        for category, title, price, heat, listing_type in records + SAMPLE_WANTED:
+        records = [(c, t, p, h, "offer", sc) for c, items in SAMPLE_ITEMS.items() for t, p, h, sc in items]
+        for category, title, price, heat, listing_type, subcategory in records + SAMPLE_WANTED:
             count += 1
             listing_id = str(SAMPLE_ID_BASE + count)
             city, psc = rng.choice(SAMPLE_LOCATIONS)
@@ -631,13 +763,14 @@ def seed_sample(db_path: Path | str | None = None, seed: int = 42) -> int:
             item = {
                 "id": listing_id,
                 "category": category,
+                "subcategory": subcategory,
                 "query": query,
                 "title": title,
                 "listing_type": listing_type,
                 "price_czk": price,
                 "location": city,
                 "psc": psc,
-                "url": f"{config.CATEGORY_URLS[category]}inzerat/{listing_id}/{_slug(title)}.php",
+                "url": f"{config.category_url(category)}inzerat/{listing_id}/{_slug(title)}.php",
                 "posted_at": posted.date().isoformat(),
             }
             db.upsert_listing(conn, item, db.fmt_ts(first_seen))
@@ -660,6 +793,14 @@ def seed_sample(db_path: Path | str | None = None, seed: int = 42) -> int:
 
 
 # --- CLI -------------------------------------------------------------------------
+def category_code(value: str) -> str:
+    """Проверка кода рубрики для argparse: любой поддомен Bazos, не только из списка."""
+    code = value.strip().lower()
+    if not re.match(config.CATEGORY_CODE_RE, code):
+        raise argparse.ArgumentTypeError(f"некорректный код рубрики: {value!r}")
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m src.scraper",
@@ -668,9 +809,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--categories",
         nargs="+",
-        choices=sorted(config.CATEGORY_URLS),
-        default=list(config.CATEGORY_URLS),
-        help="категории для сбора",
+        type=category_code,
+        default=None,
+        metavar="CODE",
+        help=f"рубрики (поддомены Bazos); по умолчанию все {len(config.CATEGORY_LABELS)}: "
+        + ", ".join(config.CATEGORY_LABELS),
+    )
+    p.add_argument(
+        "--subcategory", help="обходить только эту подкатегорию (slug, напр. apple) выбранной рубрики"
+    )
+    p.add_argument(
+        "--discover",
+        action="store_true",
+        help="обновить справочник рубрик и подкатегорий с сайта и выйти",
+    )
+    p.add_argument(
+        "--by-subcategory",
+        action="store_true",
+        help="обходить каждую подкатегорию из справочника (объявления получают тег подкатегории)",
     )
     p.add_argument(
         "--pages",
@@ -722,18 +878,41 @@ def main(argv: list[str] | None = None) -> int:
         n = seed_sample(args.db)
         print(f"Добавлено демо-объявлений: {n}. Состояние базы: {db.table_counts(args.db)}")
         return 0
+    if args.discover:
+        res = discover(args.categories, args.db)
+        for code, subs in res["subcategories"].items():
+            label = config.CATEGORY_LABELS.get(code, res["rubrics"].get(code, code))
+            print(f"{code:<10} {label:<22} подкатегорий: {len(subs):>3}  {', '.join(list(subs)[:8])}")
+        if res["new_rubrics"]:
+            print(f"Новые рубрики на сайте (нет в config): {', '.join(res['new_rubrics'])}")
+        return 0
     if args.update:
         stats = update_active(args.categories, args.limit, args.db)
         print(f"Проверка завершена: {stats}")
         return 0
+    categories = args.categories or list(config.CATEGORY_LABELS)
+    if args.subcategory and len(categories) != 1:
+        print("--subcategory требует ровно одну рубрику: --categories mobil --subcategory apple")
+        return 2
+    if args.by_subcategory:
+        stats = scrape_by_subcategory(
+            categories,
+            args.pages,
+            args.query,
+            fetch_details=not args.no_details,
+            detail_limit=args.detail_limit,
+            db_path=args.db,
+        )
+        print(f"Сбор по подкатегориям завершён: {stats}")
+        return 0
     if args.count:
-        for row in count_market(args.categories, db_path=args.db):
+        for row in count_market(categories, db_path=args.db):
             total = "н/д" if row["total"] is None else f"{row['total']:,}".replace(",", " ")
             print(f"{row['category']:<8} {row['kind']:<7} {row['query'] or '(вся рубрика)':<14} {total}")
         return 0
     if args.demand:
         stats = scrape_demand(
-            args.categories,
+            categories,
             args.pages,
             fetch_details=not args.no_details,
             detail_limit=args.detail_limit,
@@ -742,12 +921,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Сбор спроса завершён: {stats}")
         return 0
     stats = scrape(
-        args.categories,
+        categories,
         args.pages,
         args.query,
         fetch_details=not args.no_details,
         detail_limit=args.detail_limit,
         db_path=args.db,
+        subcategory=args.subcategory,
     )
     print(f"Сбор завершён: {stats}")
     return 0

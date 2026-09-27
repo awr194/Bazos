@@ -15,13 +15,24 @@ from src import analytics, config, db, scraper
 
 st.set_page_config(page_title="Bazos: аналитика спроса", page_icon="📈", layout="wide")
 
-# Фиксированные цвета категорий (порядок проверен на различимость при дальтонизме).
-CATEGORY_COLORS = {"mobil": "#2a78d6", "pc": "#eb6834", "elektro": "#1baf7a", "auto": "#eda100"}
+# Рубрик 20 — различимых цветов на всех не хватит, поэтому столбцы одного цвета,
+# а рубрика видна в подписи/подсказке.
 ACCENT = "#2a78d6"
 
 
+@st.cache_data(ttl=600)
+def load_taxonomy() -> dict[tuple[str, str], str]:
+    """Названия рубрик и подкатегорий с сайта (заполняется через --discover)."""
+    db.init_db()
+    return {(r["category"], r["subcategory"]): r["name"] for r in db.list_taxonomy() if r["name"]}
+
+
 def cat_label(code: str) -> str:
-    return config.CATEGORY_LABELS.get(code, code)
+    """'mobil' -> 'Мобильные телефоны'; 'mobil/apple' -> 'Мобильные телефоны / Apple'."""
+    cat, _, sub = str(code).partition("/")
+    names = load_taxonomy()
+    label = config.CATEGORY_LABELS.get(cat) or names.get((cat, "")) or cat
+    return f"{label} / {names.get((cat, sub), sub)}" if sub else label
 
 
 @st.cache_data(ttl=300, show_spinner="Загружаю данные из SQLite…")
@@ -147,8 +158,8 @@ def render_demand(data: pd.DataFrame) -> None:
         )
 
     # --- По категориям -------------------------------------------------------------------
-    st.subheader("Спрос и предложение по категориям")
-    sd = analytics.supply_demand_by_category(data)
+    st.subheader("Спрос и предложение по " + ("рубрикам" if group_col == "category" else "подкатегориям"))
+    sd = analytics.supply_demand_by_category(data, by=group_col).rename(columns={group_col: "category"})
     sd["category"] = sd["category"].map(cat_label)
     st.dataframe(
         sd.rename(
@@ -175,7 +186,7 @@ def render_demand(data: pd.DataFrame) -> None:
     if q:
         table = table[table["title"].str.lower().str.contains(q.strip().lower(), regex=False)]
     table = table.sort_values("first_seen", ascending=False)
-    table["category"] = table["category"].map(cat_label)
+    table["category"] = table["tag"].map(cat_label)
     st.dataframe(
         table[
             ["title", "category", "price_czk", "location", "views_current", "is_active", "posted_at", "url"]
@@ -199,11 +210,36 @@ def render_demand(data: pd.DataFrame) -> None:
 st.sidebar.title("Фильтры")
 all_data = load_data()
 
-categories = st.sidebar.multiselect(
-    "Категории",
-    options=list(config.CATEGORY_URLS),
-    default=list(config.CATEGORY_URLS),
+category_options = list(config.CATEGORY_LABELS) + sorted(
+    set(all_data["category"]) - set(config.CATEGORY_LABELS) if not all_data.empty else set()
+)
+selected = st.sidebar.multiselect(
+    f"Рубрики (всего {len(category_options)})",
+    options=category_options,
     format_func=cat_label,
+    placeholder="Все рубрики",
+)
+categories = selected or category_options
+
+tag_options = (
+    sorted(
+        all_data.loc[all_data["category"].isin(categories) & all_data["subcategory"].notna(), "tag"].unique()
+    )
+    if not all_data.empty
+    else []
+)
+tags = st.sidebar.multiselect(
+    "Подкатегории",
+    options=tag_options,
+    format_func=cat_label,
+    placeholder="Все подкатегории",
+    help="Подкатегории появляются после `--discover` и `--by-subcategory`.",
+)
+group_col = st.sidebar.radio(
+    "Группировать таблицы",
+    options=["category", "tag"],
+    format_func=lambda v: "по рубрикам" if v == "category" else "по подкатегориям",
+    horizontal=True,
 )
 
 if all_data.empty:
@@ -224,6 +260,7 @@ st.sidebar.subheader("Обновление данных")
 if st.sidebar.button("🔄 Перечитать базу", use_container_width=True):
     load_data.clear()
     load_market_counts.clear()
+    load_taxonomy.clear()
     st.rerun()
 
 if st.sidebar.button(
@@ -266,6 +303,18 @@ with st.sidebar.expander("Сбор с Bazos.cz (медленно)"):
         load_data.clear()
         load_market_counts.clear()
         st.success(f"Готово: {stats}")
+    if st.button("🗂 Обновить справочник рубрик", use_container_width=True):
+        with st.spinner("Читаю рубрики и подкатегории с сайта…"):
+            res = scraper.discover(selected or None)
+        load_taxonomy.clear()
+        n_subs = sum(len(v) for v in res["subcategories"].values())
+        st.success(f"Рубрик: {len(res['subcategories'])}, подкатегорий: {n_subs}")
+    if st.button("🏷 Собрать по подкатегориям", use_container_width=True):
+        with st.spinner("Обхожу подкатегории…"):
+            stats = scraper.scrape_by_subcategory(categories, int(pages))
+        load_data.clear()
+        load_market_counts.clear()
+        st.success(f"Готово: {stats}")
     if st.button("📊 Замерить объём рынка", use_container_width=True, disabled=not categories):
         with st.spinner("Считаю объявления в рубриках…"):
             scraper.count_market(categories)
@@ -274,6 +323,8 @@ with st.sidebar.expander("Сбор с Bazos.cz (медленно)"):
 
 # --- Данные с учётом фильтров ------------------------------------------------------
 df = all_data[all_data["category"].isin(categories)] if categories else all_data.iloc[0:0]
+if tags:
+    df = df[df["tag"].isin(tags)]
 df = df[(df["first_seen"].dt.date >= date_from) & (df["first_seen"].dt.date <= date_to)]
 
 st.title("📈 Bazos.cz — спрос и предложение")
@@ -314,7 +365,7 @@ with tab_supply:
     c3.metric(
         "Самая быстрая категория",
         "—" if m["fastest_category"] is None else cat_label(m["fastest_category"]),
-        help="Минимальное среднее время жизни снятых объявлений",
+        help="Минимальное среднее время жизни снятых объявлений (среди рубрик, где снято ≥ 3)",
     )
     c4.metric("Среднее время жизни в ней", fmt_hours(m["fastest_lifetime_h"]))
 
@@ -327,18 +378,16 @@ with tab_supply:
         if hot.empty:
             st.info("Недостаточно снимков для расчёта VPH.")
         else:
-            hot["label"] = hot["title"].str.slice(0, 45)
-            hot["Категория"] = hot["category"].map(cat_label)
+            hot["label"] = hot["title"].str.slice(0, 40) + " · " + hot["category"]
+            hot["Категория"] = hot["tag"].map(cat_label)
             fig = px.bar(
                 hot.iloc[::-1],
                 x="vph",
                 y="label",
                 orientation="h",
-                color="category",
-                color_discrete_map=CATEGORY_COLORS,
-                category_orders={"category": list(CATEGORY_COLORS)},
+                color_discrete_sequence=[ACCENT],
                 custom_data=["title", "Категория", "price_czk", "views_current"],
-                labels={"vph": "Просмотров в час", "label": "", "category": "Категория"},
+                labels={"vph": "Просмотров в час", "label": ""},
             )
             fig.update_traces(
                 marker_line_width=0,
@@ -346,12 +395,11 @@ with tab_supply:
                 "VPH: %{x:.1f}<br>Цена: %{customdata[2]:,.0f} Kč<br>"
                 "Просмотров: %{customdata[3]}<extra></extra>",
             )
-            fig.for_each_trace(lambda t: t.update(name=cat_label(t.name)))
             fig.update_layout(
                 height=520,
                 margin=dict(l=0, r=10, t=10, b=0),
                 bargap=0.25,
-                legend=dict(orientation="h", y=-0.12, title=None),
+                showlegend=False,
                 yaxis=dict(categoryorder="array", categoryarray=list(hot["label"][::-1])),
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -410,7 +458,7 @@ with tab_supply:
             use_container_width=True,
         )
     with t2:
-        turn = analytics.category_turnover(df)
+        turn = analytics.category_turnover(df, by=group_col).rename(columns={group_col: "category"})
         turn["category"] = turn["category"].map(cat_label)
         st.dataframe(
             turn.rename(
@@ -481,7 +529,7 @@ with tab_supply:
         ).str.lower()
         active = active[hay.str.contains(needle, regex=False)]
     active = active.sort_values("demand_score", ascending=False, na_position="last")
-    active["category"] = active["category"].map(cat_label)
+    active["category"] = active["tag"].map(cat_label)
     st.dataframe(
         active[
             [

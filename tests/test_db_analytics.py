@@ -24,7 +24,7 @@ def test_init_db_is_idempotent(tmp_path):
     with db.get_connection(path) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"listings", "listing_snapshots"} <= tables
-    assert db.table_counts(path) == {"listings": 0, "listing_snapshots": 0, "market_counts": 0}
+    assert db.table_counts(path) == {"listings": 0, "listing_snapshots": 0, "market_counts": 0, "taxonomy": 0}
 
 
 def test_connection_is_closed_and_rolled_back(tmp_path):
@@ -60,15 +60,18 @@ def test_analytics_on_seed(seeded):
 
     m = analytics.summary_metrics(df)
     assert m["active"] + m["removed"] == n and m["median_vph"] > 0
-    assert m["fastest_category"] in {"mobil", "pc", "elektro", "auto"}
+    assert m["fastest_category"] in set(df["category"])
 
     kw = analytics.top_keywords_by_vph(df, 10)
     assert 0 < len(kw) <= 10 and kw["avg_vph"].is_monotonic_decreasing
     assert (kw["listings"] >= 2).all()
 
     turn = analytics.category_turnover(df)
-    assert set(turn["category"]) == {"mobil", "pc", "elektro", "auto"}
-    assert analytics.price_of_fast_sellers(df)["category"].nunique() == 4
+    assert {"mobil", "pc", "elektro", "auto", "motorky", "sport"} <= set(turn["category"])
+    assert analytics.price_of_fast_sellers(df)["category"].nunique() >= 4
+
+    by_tag = analytics.category_turnover(df, by="tag")
+    assert "mobil/apple" in set(by_tag["tag"]) and by_tag["listings"].sum() == n
     assert not analytics.price_elasticity(df).empty
     assert len(analytics.hottest_items(df, 15)) == 15
 
@@ -120,7 +123,8 @@ def test_migration_adds_listing_type(tmp_path):
     conn.close()
     db.init_db(path)
     with db.get_connection(path) as conn:
-        assert conn.execute("SELECT listing_type FROM listings").fetchone()[0] == "offer"
+        row = conn.execute("SELECT listing_type, subcategory FROM listings").fetchone()
+        assert row["listing_type"] == "offer" and row["subcategory"] is None
 
 
 def test_supply_demand_on_seed(seeded):
@@ -131,7 +135,7 @@ def test_supply_demand_on_seed(seeded):
     sd = analytics.supply_demand_by_category(df).set_index("category")
     assert sd["wanted"].sum() == len(analytics.wanted(df)) == 8
     assert sd.loc["auto", "buyouts"] == 1
-    assert (sd["demand_per_100_offers"] > 0).all()
+    assert (sd.loc[["mobil", "pc", "elektro", "auto"], "demand_per_100_offers"] > 0).all()
 
     kw = analytics.supply_demand_by_keyword(df).set_index("keyword")
     assert kw.loc["iphone", "wanted"] == 2 and kw.loc["iphone", "offers"] >= 1
@@ -153,3 +157,25 @@ def test_market_balance(tmp_path):
     assert bal.loc["mobil", "offers_total"] == 6000
     assert bal.loc["mobil", "demand_hits"] == 120
     assert bal.loc["mobil", "demand_per_1000"] == 20.0
+
+
+def test_supply_demand_by_subcategory(seeded):
+    path, _ = seeded
+    df = analytics.load_listings(path)
+    sd = analytics.supply_demand_by_category(df, by="tag").set_index("tag")
+    assert sd.loc["auto/skoda", "wanted"] == 2
+    assert sd.loc["mobil/apple", "wanted"] == 2
+
+
+def test_taxonomy(tmp_path):
+    path = db.init_db(tmp_path / "t.db")
+    with db.get_connection(path) as conn:
+        db.upsert_taxonomy(conn, "mobil", "", "Mobily", "https://mobil.bazos.cz/", "2026-09-01 00:00:00")
+        db.upsert_taxonomy(
+            conn, "mobil", "apple", "Apple", "https://mobil.bazos.cz/apple/", "2026-09-01 00:00:00"
+        )
+        db.upsert_taxonomy(
+            conn, "mobil", "apple", None, "https://mobil.bazos.cz/apple/", "2026-09-02 00:00:00"
+        )
+    rows = db.list_taxonomy(path, ["mobil"])
+    assert [(r["subcategory"], r["name"]) for r in rows] == [("", "Mobily"), ("apple", "Apple")]

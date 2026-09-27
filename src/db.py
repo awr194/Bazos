@@ -19,7 +19,8 @@ from src.config import DB_PATH
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
     id              TEXT PRIMARY KEY,          -- ID объявления на Bazos
-    category        TEXT NOT NULL,             -- mobil / pc / elektro / auto
+    category        TEXT NOT NULL,             -- рубрика (поддомен): mobil / pc / auto / ...
+    subcategory     TEXT,                      -- подкатегория (путь): apple / skoda / ...
     query           TEXT,                      -- поисковый запрос, по которому найдено (если был)
     title           TEXT NOT NULL,
     listing_type    TEXT NOT NULL DEFAULT 'offer', -- offer = продаю, demand = «Koupím/Sháním»
@@ -56,6 +57,16 @@ CREATE TABLE IF NOT EXISTS market_counts (
     total        INTEGER NOT NULL
 );
 
+-- Справочник рубрик и подкатегорий сайта (python -m src.scraper --discover).
+CREATE TABLE IF NOT EXISTS taxonomy (
+    category       TEXT NOT NULL,
+    subcategory    TEXT NOT NULL DEFAULT '',   -- '' — сама рубрика
+    name           TEXT,                       -- название на сайте (по-чешски)
+    url            TEXT NOT NULL,
+    discovered_at  TEXT NOT NULL,
+    PRIMARY KEY (category, subcategory)
+);
+
 CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category);
 CREATE INDEX IF NOT EXISTS idx_listings_active ON listings(is_active);
 CREATE INDEX IF NOT EXISTS idx_snapshots_listing ON listing_snapshots(listing_id, captured_at);
@@ -64,8 +75,12 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_listing ON listing_snapshots(listing_id
 # Колонки, добавленные после первой версии схемы: (таблица, колонка, определение).
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("listings", "listing_type", "TEXT NOT NULL DEFAULT 'offer'"),
+    ("listings", "subcategory", "TEXT"),
 ]
-POST_MIGRATION_SQL = "CREATE INDEX IF NOT EXISTS idx_listings_type ON listings(listing_type);"
+POST_MIGRATION_SQL = """
+CREATE INDEX IF NOT EXISTS idx_listings_type ON listings(listing_type);
+CREATE INDEX IF NOT EXISTS idx_listings_subcategory ON listings(category, subcategory);
+"""
 
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -124,6 +139,7 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
                SET title = ?, price_czk = COALESCE(?, price_czk), location = COALESCE(?, location),
                    psc = COALESCE(?, psc), url = ?, posted_at = COALESCE(?, posted_at),
                    query = COALESCE(query, ?), listing_type = COALESCE(?, listing_type),
+                   subcategory = COALESCE(?, subcategory),
                    last_seen = ?, is_active = 1, removed_at = NULL
              WHERE id = ?
             """,
@@ -136,6 +152,7 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
                 item.get("posted_at"),
                 item.get("query"),
                 item.get("listing_type"),
+                item.get("subcategory"),
                 seen_at,
                 item["id"],
             ),
@@ -143,13 +160,14 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
         return False
     conn.execute(
         """
-        INSERT INTO listings (id, category, query, title, listing_type, price_czk, location, psc,
-                              url, posted_at, first_seen, last_seen, is_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        INSERT INTO listings (id, category, subcategory, query, title, listing_type, price_czk,
+                              location, psc, url, posted_at, first_seen, last_seen, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         """,
         (
             item["id"],
             item["category"],
+            item.get("subcategory"),
             item.get("query"),
             item["title"],
             item.get("listing_type") or "offer",
@@ -230,12 +248,42 @@ def add_market_count(
     )
 
 
+def upsert_taxonomy(
+    conn: sqlite3.Connection, category: str, subcategory: str, name: str | None, url: str, when: str
+) -> None:
+    """Добавляет/обновляет рубрику ('' в subcategory) или подкатегорию в справочнике."""
+    conn.execute(
+        """
+        INSERT INTO taxonomy (category, subcategory, name, url, discovered_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(category, subcategory) DO UPDATE
+           SET name = COALESCE(excluded.name, name), url = excluded.url,
+               discovered_at = excluded.discovered_at
+        """,
+        (category, subcategory, name, url, when),
+    )
+
+
+def list_taxonomy(
+    db_path: Path | str | None = None, categories: Iterable[str] | None = None
+) -> list[dict[str, Any]]:
+    """Все известные рубрики и подкатегории."""
+    sql = "SELECT category, subcategory, name, url FROM taxonomy"
+    params: list[Any] = []
+    cats = list(categories or [])
+    if cats:
+        sql += f" WHERE category IN ({','.join('?' * len(cats))})"
+        params.extend(cats)
+    sql += " ORDER BY category, subcategory"
+    with get_connection(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
 def table_counts(db_path: Path | str | None = None) -> dict[str, int]:
     """Число строк в таблицах — для быстрой проверки состояния базы."""
     with get_connection(db_path) as conn:
         return {
             t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            for t in ("listings", "listing_snapshots", "market_counts")
+            for t in ("listings", "listing_snapshots", "market_counts", "taxonomy")
         }
 
 

@@ -11,19 +11,41 @@ DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = Path(os.environ.get("BAZOS_DB_PATH", DATA_DIR / "bazos.db"))
 
 # --- Категории Bazos.cz ------------------------------------------------------
-# Каждая рубрика живёт на своём поддомене; пагинация — смещение по 20: /20/, /40/, ...
-CATEGORY_URLS: dict[str, str] = {
-    "mobil": "https://mobil.bazos.cz/",
-    "pc": "https://pc.bazos.cz/",
-    "elektro": "https://elektro.bazos.cz/",
-    "auto": "https://auto.bazos.cz/",
-}
+# Все рубрики сайта. Каждая живёт на своём поддомене https://<код>.bazos.cz/,
+# подкатегории — на путях вида https://mobil.bazos.cz/apple/ (обнаруживаются через --discover).
+# Пагинация — смещение по 20: /20/, /40/, ...
 CATEGORY_LABELS: dict[str, str] = {
-    "mobil": "Мобильные телефоны",
-    "pc": "Компьютеры",
-    "elektro": "Электроника",
+    "zvirata": "Животные",
+    "deti": "Детские товары",
+    "reality": "Недвижимость",
+    "prace": "Работа",
     "auto": "Автомобили",
+    "motorky": "Мотоциклы",
+    "stroje": "Техника и станки",
+    "dum": "Дом и сад",
+    "pc": "Компьютеры",
+    "mobil": "Мобильные телефоны",
+    "foto": "Фото",
+    "elektro": "Электроника",
+    "sport": "Спорт",
+    "hudba": "Музыка",
+    "vstupenky": "Билеты",
+    "knihy": "Книги",
+    "nabytek": "Мебель",
+    "obleceni": "Одежда",
+    "sluzby": "Услуги",
+    "ostatni": "Прочее",
 }
+CATEGORY_CODE_RE = r"^[a-z0-9-]{2,30}$"
+
+
+def category_url(code: str) -> str:
+    """URL рубрики по её коду (поддомену), в т.ч. для рубрик, которых нет в списке выше."""
+    return f"https://{code}.bazos.cz/"
+
+
+CATEGORY_URLS: dict[str, str] = {code: category_url(code) for code in CATEGORY_LABELS}
+HOMEPAGE_URL = "https://www.bazos.cz/"
 LISTINGS_PER_PAGE = 20
 DEFAULT_PAGES = 2
 

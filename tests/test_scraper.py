@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import httpx
 import pytest
 
@@ -243,3 +245,69 @@ def test_scrape_demand_and_count_market(tmp_path):
         ("pc", "offer", 50000),
     }
     assert all(r["total"] == 214 for r in rows if r["query"])
+
+
+HOMEPAGE_HTML = """
+<html><body>
+<a href="https://auto.bazos.cz/">Auto</a> <a href="https://mobil.bazos.cz/">Mobily</a>
+<a href="https://novinka.bazos.cz">Novinka</a> <a href="https://www.bazos.cz/">Bazoš</a>
+<a href="https://mobil.bazos.cz/inzerat/1/x.php">iPhone</a>
+</body></html>
+"""
+
+RUBRIC_HTML = """
+<html><body>
+<div class="barvaleva">
+  <a href="/apple/">Apple</a> <a href="https://mobil.bazos.cz/samsung/">Samsung</a>
+  <a href="/xiaomi/">Xiaomi</a> <a href="/20/">2</a> <a href="/inzerat/5/x.php">Inzerát</a>
+  <a href="/pridat-inzerat.php">Přidat</a> <a href="https://pc.bazos.cz/notebooky/">Notebooky</a>
+  <a href="/search/">Hledat</a> <a href="/apple/"><img src="a.png"></a>
+</div>
+</body></html>
+"""
+
+
+def test_parse_rubrics_and_subcategories():
+    assert scraper.parse_rubrics(HOMEPAGE_HTML) == {"auto": "Auto", "mobil": "Mobily", "novinka": "Novinka"}
+    subs = scraper.parse_subcategories(RUBRIC_HTML, "mobil")
+    assert subs == {"apple": "Apple", "samsung": "Samsung", "xiaomi": "Xiaomi"}
+
+
+def test_all_rubrics_and_urls():
+    from src import config
+
+    assert len(config.CATEGORY_LABELS) == 20 and {"auto", "reality", "zvirata"} <= set(config.CATEGORY_URLS)
+    assert scraper.category_page_url("mobil", 0, "apple") == "https://mobil.bazos.cz/apple/"
+    assert scraper.category_page_url("mobil", 1, "apple") == "https://mobil.bazos.cz/apple/20/"
+    assert scraper.category_code(" Novinka ") == "novinka"
+    with pytest.raises(argparse.ArgumentTypeError):
+        scraper.category_code("bad code!")
+
+
+def test_discover_and_scrape_by_subcategory(tmp_path):
+    db_path = tmp_path / "s.db"
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append(url)
+        if request.url.host == "www.bazos.cz":
+            return httpx.Response(200, text=HOMEPAGE_HTML)
+        if request.url.path == "/":
+            return httpx.Response(200, text=RUBRIC_HTML)
+        if request.url.path == "/apple/":
+            return httpx.Response(200, text=LIST_HTML)
+        return httpx.Response(200, text="<html></html>")
+
+    with _client(handler) as client:
+        res = scraper.discover(["mobil"], db_path=db_path, client=client)
+        stats = scraper.scrape_by_subcategory(["mobil"], pages=1, db_path=db_path, client=client)
+    assert res["new_rubrics"] == ["novinka"]
+    assert set(res["subcategories"]["mobil"]) == {"apple", "samsung", "xiaomi"}
+    assert stats["subcategories"] == 3 and stats["new"] == 3
+    assert "https://mobil.bazos.cz/apple/" in seen
+    with db.get_connection(db_path) as conn:
+        subs = {r[0] for r in conn.execute("SELECT DISTINCT subcategory FROM listings")}
+        kinds = {r[0] for r in conn.execute("SELECT DISTINCT kind FROM market_counts")}
+    assert subs == {"apple"}
+    assert kinds <= {"subcategory"}  # замер подкатегории не перетирает итог рубрики

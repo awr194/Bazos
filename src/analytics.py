@@ -141,6 +141,11 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     if "listing_type" not in df:
         df["listing_type"] = "offer"
     df["listing_type"] = df["listing_type"].fillna("offer")
+    if "subcategory" not in df:
+        df["subcategory"] = None
+    # Тег «рубрика/подкатегория» — для группировки на уровне подкатегорий.
+    sub = df["subcategory"].fillna("").astype(str)
+    df["tag"] = df["category"].where(sub == "", df["category"] + "/" + sub)
 
     hours = (df["last_snap_at"] - df["first_snap_at"]).dt.total_seconds() / 3600
     delta = df["views_last"] - df["views_first"]
@@ -160,12 +165,18 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --- Метрики ------------------------------------------------------------------
-def summary_metrics(df: pd.DataFrame) -> dict[str, object]:
-    """Карточки дашборда: активные, медианный VPH, самая «быстрая» категория."""
+def summary_metrics(df: pd.DataFrame, min_removed: int = 3) -> dict[str, object]:
+    """Карточки дашборда: активные, медианный VPH, самая «быстрая» категория.
+
+    «Быстрая» выбирается среди категорий, где снято ≥ min_removed объявлений (иначе одно
+    случайное объявление делает рубрику «самой быстрой»); если таких нет — среди всех.
+    """
     turnover = category_turnover(df)
     fastest = None
     if not turnover.empty and turnover["avg_lifetime_h"].notna().any():
-        fastest = turnover.sort_values("avg_lifetime_h").iloc[0]
+        reliable = turnover[turnover["removed"] >= min_removed]
+        pool = reliable if reliable["avg_lifetime_h"].notna().any() else turnover
+        fastest = pool.sort_values("avg_lifetime_h").iloc[0]
     return {
         "total": int(len(df)),
         "active": int(df["is_active"].sum()) if len(df) else 0,
@@ -227,12 +238,15 @@ def top_queries_by_vph(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     )
 
 
-def category_turnover(df: pd.DataFrame, fast_hours: float = 48) -> pd.DataFrame:
-    """Оборачиваемость по категориям; `is_fast` — среднее время жизни < fast_hours."""
+def category_turnover(df: pd.DataFrame, fast_hours: float = 48, by: str = "category") -> pd.DataFrame:
+    """Оборачиваемость по категориям (by="category") или подкатегориям (by="tag").
+
+    `is_fast` — среднее время жизни < fast_hours.
+    """
     if df.empty:
         return pd.DataFrame(
             columns=[
-                "category",
+                by,
                 "listings",
                 "removed",
                 "avg_lifetime_h",
@@ -243,7 +257,7 @@ def category_turnover(df: pd.DataFrame, fast_hours: float = 48) -> pd.DataFrame:
                 "is_fast",
             ]
         )
-    g = df.groupby("category")
+    g = df.groupby(by)
     out = pd.DataFrame(
         {
             "listings": g["id"].count(),
@@ -352,14 +366,15 @@ def wanted(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["listing_type"] == "demand"]
 
 
-def supply_demand_by_category(df: pd.DataFrame) -> pd.DataFrame:
+def supply_demand_by_category(df: pd.DataFrame, by: str = "category") -> pd.DataFrame:
     """По категориям: сколько продают и сколько ищут, и цена продавцов против бюджета покупателей.
 
     `demand_per_100_offers` — сколько объявлений «куплю» приходится на 100 объявлений «продаю»
     в собранной выборке. `budget_to_price` < 1 — покупатели готовы платить меньше, чем просят.
+    by="tag" — то же на уровне подкатегорий.
     """
     cols = [
-        "category",
+        by,
         "offers",
         "wanted",
         "buyouts",
@@ -371,12 +386,12 @@ def supply_demand_by_category(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=cols)
     rows = []
-    for cat, g in df.groupby("category"):
+    for key, g in df.groupby(by):
         o, w = offers(g), wanted(g)
         op, wb = o["price_czk"].median(), w["price_czk"].median()
         rows.append(
             {
-                "category": cat,
+                by: key,
                 "offers": len(o),
                 "wanted": len(w),
                 "buyouts": int((g["listing_type"] == "buyout").sum()),
