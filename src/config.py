@@ -88,6 +88,26 @@ DEMAND_QUERIES: tuple[str, ...] = ("koupím", "sháním", "hledám")
 # --- Демо-данные -------------------------------------------------------------
 SAMPLE_ID_BASE = 900_000_000  # ID демо-объявлений (--seed-sample); реальные ID Bazos меньше
 
+# --- Цены-заглушки -----------------------------------------------------------
+# Продавцы и покупатели часто ставят «1 Kč», «123456» или максимум поля (2 147 483 647),
+# чтобы не указывать цену. Такие значения считаем отсутствующей ценой.
+MIN_REAL_PRICE = 2
+MAX_REAL_PRICE = 50_000_000
+PLACEHOLDER_PRICES: frozenset[int] = frozenset(
+    {12345, 123456, 1234567, 12345678, 98765, 987654, 9876543, 99999, 999999, 9999999, 111111, 2147483647}
+)
+
+
+def clean_price(value: int | float | None) -> int | None:
+    """Цена CZK или None, если это заглушка («1 Kč», «123456», 2^31−1 …)."""
+    if value is None or value != value:  # None или NaN
+        return None
+    v = int(value)
+    if v < MIN_REAL_PRICE or v > MAX_REAL_PRICE or v in PLACEHOLDER_PRICES:
+        return None
+    return v
+
+
 # --- Аналитика ---------------------------------------------------------------
 FAST_SALE_HOURS = (24, 48)  # пороги «ликвидности»
 MIN_HOURS_FOR_VPH = 0.5  # меньший интервал даёт шумный VPH

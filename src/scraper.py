@@ -299,6 +299,7 @@ def parse_listing_page(
         listing_type = classify_listing(title, description)
         if price is None and listing_type == "demand":
             price = parse_price(title)  # бюджет покупателя: «Koupím iPhone 13 do 8 000 Kč»
+        price = config.clean_price(price)
 
         views = None
         view_node = _find_by_class_fragment(card, ("view",))
@@ -342,7 +343,7 @@ def parse_detail_page(html: str) -> DetailResult:
     # Строка таблицы вида «Cena: 12 500 Kč» — ищем по тексту, а не по классам.
     m = re.search(r"Cena\s*:\s*([^|]{0,40}?K[čc]|Dohodou|V textu|Zdarma)", text, re.IGNORECASE)
     if m:
-        price = parse_price(m.group(1))
+        price = config.clean_price(parse_price(m.group(1)))
     return DetailResult(status="active", views=views, price_czk=price)
 
 

@@ -133,6 +133,16 @@ STOPWORDS = {
     "jakekoliv",
     "větší",
     "množství",
+    "podobné",
+    "podobne",
+    "max",
+    "praha",
+    "brno",
+    "ostrava",
+    "plzeň",
+    "plzen",
+    "olomouc",
+    "liberec",
 }
 LISTING_TYPE_LABELS = {"offer": "Продаю", "demand": "Куплю / ищу", "buyout": "Перекупщики"}
 TOKEN_RE = re.compile(r"[a-zá-žA-ZÁ-Ž][\wá-žÁ-Ž]+", re.UNICODE)
@@ -170,6 +180,8 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     df["listing_type"] = df["listing_type"].fillna("offer")
     if "subcategory" not in df:
         df["subcategory"] = None
+    # Заглушки «1 Kč», «123456», 2^31−1 не являются ценой (в т.ч. в уже собранных данных).
+    df["price_czk"] = pd.to_numeric(df["price_czk"], errors="coerce").map(config.clean_price).astype(float)
     df["is_demo"] = pd.to_numeric(df["id"], errors="coerce").fillna(0) >= config.SAMPLE_ID_BASE
     # Тег «рубрика/подкатегория» — для группировки на уровне подкатегорий.
     sub = df["subcategory"].fillna("").astype(str)

@@ -179,3 +179,23 @@ def test_taxonomy(tmp_path):
         )
     rows = db.list_taxonomy(path, ["mobil"])
     assert [(r["subcategory"], r["name"]) for r in rows] == [("", "Mobily"), ("apple", "Apple")]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (8500, 8500),
+        (1, None),
+        (0, None),
+        (2147483647, None),
+        (123456, None),
+        (987654, None),
+        (None, None),
+        (float("nan"), None),
+        (650000, 650000),
+    ],
+)
+def test_clean_price(value, expected):
+    from src import config
+
+    assert config.clean_price(value) == expected
