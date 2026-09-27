@@ -66,21 +66,26 @@ def render_demand(data: pd.DataFrame) -> None:
     )
     o, w = analytics.offers(data), analytics.wanted(data)
     buyouts = int((data["listing_type"] == "buyout").sum())
+    balance = analytics.market_balance(load_market_counts())
+    if categories:
+        balance = balance[balance["category"].isin(categories)]
+    offers_total = balance["offers_total"].sum() if not balance.empty else 0
+    demand_total = balance["demand_hits"].sum() if not balance.empty else 0
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Объявлений «продаю»", fmt_int(len(o)))
-    c2.metric("Объявлений «куплю / ищу»", fmt_int(len(w)))
+    c1.metric("Собрано «продаю»", fmt_int(len(o)))
+    c2.metric("Собрано «куплю / ищу»", fmt_int(len(w)))
     c3.metric(
-        "«Куплю» на 100 «продаю»",
-        f"{len(w) / len(o) * 100:.1f}" if len(o) else "—",
-        help="По собранной выборке. Общий объём рынка — в блоке ниже (замер --count).",
+        "Спрос на 1000 объявлений рынка",
+        f"{demand_total / offers_total * 1000:.1f}" if offers_total else "—",
+        help="По замеру --count: объявления по словам спроса на 1000 объявлений в выбранных рубриках. "
+        "Соотношение собранных объявлений для этого не годится: спрос собирается прицельным поиском, "
+        "а продажи — только с первых страниц рубрик.",
     )
     c4.metric("Перекупщиков", fmt_int(buyouts))
 
     # --- Объём рынка по замерам --count ------------------------------------------
     st.subheader("Объём рынка на Bazos.cz")
-    balance = analytics.market_balance(load_market_counts())
-    if categories:
-        balance = balance[balance["category"].isin(categories)]
     if balance.empty:
         st.info(
             "Замеров общего объёма ещё нет. Выполните `python -m src.scraper --count` — "
@@ -153,8 +158,9 @@ def render_demand(data: pd.DataFrame) -> None:
             use_container_width=True,
         )
         st.caption(
-            "«Ищут / продают» > 1 — дефицит: покупателей больше, чем предложений. "
-            "Пусто — предложений в выборке нет совсем."
+            "«Ищут / продают» > 1 — дефицит: покупателей больше, чем предложений; пусто — предложений "
+            "в выборке нет. Сравнивайте слова между собой: абсолютное значение завышено, потому что "
+            "спрос собирается прицельным поиском, а продажи — только с первых страниц рубрик."
         )
 
     # --- По категориям -------------------------------------------------------------------
@@ -235,6 +241,15 @@ tags = st.sidebar.multiselect(
     placeholder="Все подкатегории",
     help="Подкатегории появляются после `--discover` и `--by-subcategory`.",
 )
+has_real = not all_data.empty and bool((~all_data["is_demo"]).any())
+has_demo = not all_data.empty and bool(all_data["is_demo"].any())
+include_demo = st.sidebar.checkbox(
+    "Включать демо-данные",
+    value=not has_real,
+    disabled=not has_demo,
+    help="Демо-объявления (--seed-sample) искажают реальную статистику. "
+    "По умолчанию скрыты, если в базе есть реальные данные.",
+)
 group_col = st.sidebar.radio(
     "Группировать таблицы",
     options=["category", "tag"],
@@ -272,6 +287,12 @@ if st.sidebar.button(
     load_data.clear()
     load_market_counts.clear()
     st.sidebar.success(f"Добавлено {n} демо-объявлений")
+    st.rerun()
+
+if has_demo and st.sidebar.button("🗑 Удалить демо-данные", use_container_width=True):
+    n = scraper.clear_sample()
+    load_data.clear()
+    st.sidebar.success(f"Удалено {n} демо-объявлений")
     st.rerun()
 
 with st.sidebar.expander("Сбор с Bazos.cz (медленно)"):
@@ -323,6 +344,8 @@ with st.sidebar.expander("Сбор с Bazos.cz (медленно)"):
 
 # --- Данные с учётом фильтров ------------------------------------------------------
 df = all_data[all_data["category"].isin(categories)] if categories else all_data.iloc[0:0]
+if not include_demo:
+    df = df[~df["is_demo"]]
 if tags:
     df = df[df["tag"].isin(tags)]
 df = df[(df["first_seen"].dt.date >= date_from) & (df["first_seen"].dt.date <= date_to)]

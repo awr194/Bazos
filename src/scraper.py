@@ -49,15 +49,43 @@ TOTAL_RE = re.compile(r"Zobrazeno\s*\d+\s*[-–]\s*\d+\s*inzer\w*\s*z\s*(\d[\d\s
 TOTAL_FALLBACK_RE = re.compile(r"\bz\s+(\d[\d\s\u00a0]*)\s*inzer", re.IGNORECASE)
 
 # Объявления-«спрос»: покупатель сам пишет, что ищет. Проверяем начало заголовка/описания.
-DEMAND_RE = re.compile(
-    r"^\W*(?:koupím|koupim|koupíme|koupime|sháním|shanim|sháníme|hledám|hledam|hledáme|"
-    r"poptávám|poptavam|poptávka|poptavka|chci koupit|zájem o|mám zájem)\b",
+_W = r"(?<![\w])"  # начало слова (\b плохо дружит с чешскими буквами в начале)
+_E = r"(?![\w])"  # конец слова
+# Глаголы покупателя. В заголовке ищем их где угодно: «Termokopírka, koupím», «Pláště-sháníme».
+DEMAND_VERBS = (
+    r"koupím|koupim|koupíme|koupime|kúpim|kupím|kupim|sháním|shanim|sháníme|shanime|"
+    r"poptávám|poptavam|poptáváme|poptávka|poptavka|chci koupit|m[áa]m z[áa]jem o|nabídněte|nabidnete"
+)
+DEMAND_RE = re.compile(_W + r"(?:" + DEMAND_VERBS + r")" + _E, re.IGNORECASE)
+# «Hledám» и «Sbírám» — спрос только в начале заголовка или в конце после тире/скобки
+# («Odvalovací frézka FO 6 - HLEDÁME»); в середине это чаще «hledám kupce».
+SEEK_RE = re.compile(
+    r"^\W*(?:hledám|hledam|hledáme|hledame|sbírám|sbiram|vezmu)"
+    + _E
+    + r"|[-–(/]\s*(?:hledám|hledam|hledáme|hledame)\W*$",
+    re.IGNORECASE,
+)
+# Строгий вариант для описания: только однозначные глаголы в самом начале.
+DESC_DEMAND_RE = re.compile(
+    r"^\W*(?:koupím|koupim|kúpim|sháním|shanim|sháníme|poptávám|poptavam|nabídněte)" + _E, re.IGNORECASE
+)
+# Явные признаки продажи — перевешивают глагол спроса в середине заголовка.
+OFFER_RE = re.compile(
+    _W + r"(?:prodám|prodam|prodáme|prodej|nabízím|nabizim|nabízíme|daruji|daruju|pronajmu|pronajmeme)" + _E,
     re.IGNORECASE,
 )
 # Перекупщики («Vykoupím vaše auto», «Výkup mobilů») — отдельный тип, чтобы не искажать спрос.
-BUYOUT_RE = re.compile(r"^\W*(?:vykoupím|vykoupim|vykoupíme|vykoupime|výkup|vykup)\b", re.IGNORECASE)
-# «Hledám nového majitele» — это продажа, а не поиск.
-FALSE_DEMAND_RE = re.compile(r"nov(?:ého|eho|ý|y)\s+(?:majitele|páníčka|domov)", re.IGNORECASE)
+BUYOUT_RE = re.compile(
+    r"^\W*(?:vykoupím|vykoupim|vykoupíme|vykoupime|výkup|vykup|odkoupím|odkoupim|odkoupíme|odkoupení|odkoupeni)"
+    + _E,
+    re.IGNORECASE,
+)
+# «Hledám nového majitele / kupce», «štěňátka hledají domov» — это продажа, а не поиск.
+FALSE_DEMAND_RE = re.compile(
+    r"(?:nov(?:ého|eho|ý|y|é|e)\s+(?:majitele|majitel|páníčka|panicka|páníčky|domov|domovy|domova)"
+    r"|kupce|zájemce|zajemce|hledají|hledaji)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -131,15 +159,24 @@ def parse_location(text: str | None) -> tuple[str | None, str | None]:
 
 
 def classify_listing(title: str | None, description: str | None = None) -> str:
-    """offer — продаю, demand — «Koupím/Sháním/Hledám», buyout — перекупщики («Vykoupím»)."""
+    """offer — продаю, demand — «Koupím/Sháním/Hledám», buyout — перекупщики («Vykoupím»).
+
+    Правила выверены на реальной выгрузке: глагол покупателя в заголовке считается где угодно,
+    «hledám/sbírám» — только в начале или в конце заголовка, описание — лишь при однозначном
+    глаголе в самом начале и без признаков продажи. Фразы «hledám kupce / nového majitele» — продажа.
+    """
     t = clean_text(title)
     if BUYOUT_RE.search(t):
         return "buyout"
-    if DEMAND_RE.search(t) and not FALSE_DEMAND_RE.search(t):
+    if FALSE_DEMAND_RE.search(t):
+        return "offer"
+    starts_with_demand = bool(re.match(r"^\W*(?:" + DEMAND_VERBS + r")" + _E, t, re.IGNORECASE))
+    if OFFER_RE.search(t) and not starts_with_demand:
+        return "offer"
+    if DEMAND_RE.search(t) or SEEK_RE.search(t):
         return "demand"
-    # Заголовок без глагола («iPhone 13 do 8000») — смотрим начало описания.
-    d = clean_text(description)[:80]
-    if d and DEMAND_RE.search(d) and not FALSE_DEMAND_RE.search(d):
+    d = clean_text(description)[:120]
+    if d and DESC_DEMAND_RE.search(d) and not OFFER_RE.search(d) and not FALSE_DEMAND_RE.search(d):
         return "demand"
     return "offer"
 
@@ -258,7 +295,8 @@ def parse_listing_page(
         if psc is None:
             _, psc = parse_location(scan_text)
 
-        listing_type = classify_listing(title, _node_text(popis))
+        description = _node_text(popis)
+        listing_type = classify_listing(title, description)
         if price is None and listing_type == "demand":
             price = parse_price(title)  # бюджет покупателя: «Koupím iPhone 13 do 8 000 Kč»
 
@@ -275,6 +313,7 @@ def parse_listing_page(
                 "query": query,
                 "title": title,
                 "listing_type": listing_type,
+                "description": description[:500] or None,
                 "price_czk": price,
                 "location": location,
                 "psc": psc,
@@ -730,11 +769,34 @@ SAMPLE_WANTED: list[tuple[str, str, int | None, int, str, str | None]] = [
     ("auto", "Sháním Škoda Fabia II pro dceru", 60000, 5, "demand", "skoda"),
     ("auto", "Vykoupím vaše auto – platba ihned", None, 3, "buyout", None),
 ]
-SAMPLE_ID_BASE = 900_000_000  # диапазон, не пересекающийся с реальными ID
+SAMPLE_ID_BASE = config.SAMPLE_ID_BASE
 
 
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
+
+
+def clear_sample(db_path: Path | str | None = None) -> int:
+    """Удаляет демо-объявления (ID ≥ SAMPLE_ID_BASE) вместе со снимками. Возвращает их число."""
+    db.init_db(db_path)
+    with db.get_connection(db_path) as conn:
+        cur = conn.execute("DELETE FROM listings WHERE CAST(id AS INTEGER) >= ?", (SAMPLE_ID_BASE,))
+        return cur.rowcount
+
+
+def reclassify(db_path: Path | str | None = None) -> dict[str, int]:
+    """Пересчитывает listing_type по текущим правилам для всех объявлений в базе."""
+    db.init_db(db_path)
+    changes: dict[str, int] = {}
+    with db.get_connection(db_path) as conn:
+        rows = conn.execute("SELECT id, title, description, listing_type FROM listings").fetchall()
+        for r in rows:
+            new = classify_listing(r["title"], r["description"])
+            if new != r["listing_type"]:
+                key = f"{r['listing_type']}->{new}"
+                changes[key] = changes.get(key, 0) + 1
+                conn.execute("UPDATE listings SET listing_type = ? WHERE id = ?", (new, r["id"]))
+    return changes
 
 
 def seed_sample(db_path: Path | str | None = None, seed: int = 42) -> int:
@@ -859,6 +921,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed-sample", action="store_true", help="заполнить базу демо-данными (50 объявлений) и выйти"
     )
     p.add_argument("--init-db", action="store_true", help="только создать таблицы и выйти")
+    p.add_argument("--clear-sample", action="store_true", help="удалить демо-данные из базы и выйти")
+    p.add_argument(
+        "--reclassify",
+        action="store_true",
+        help="пересчитать тип объявлений (продаю / куплю / перекупщик) по текущим правилам и выйти",
+    )
     p.add_argument("--db", type=Path, default=None, help=f"путь к SQLite (по умолчанию {config.DB_PATH})")
     p.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
     return p
@@ -873,6 +941,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.init_db:
         path = db.init_db(args.db)
         print(f"База готова: {path} {db.table_counts(path)}")
+        return 0
+    if args.clear_sample:
+        print(f"Удалено демо-объявлений: {clear_sample(args.db)}")
+        return 0
+    if args.reclassify:
+        changes = reclassify(args.db)
+        print("Изменения типов: " + (", ".join(f"{k}: {v}" for k, v in changes.items()) or "нет"))
         return 0
     if args.seed_sample:
         n = seed_sample(args.db)

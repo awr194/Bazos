@@ -106,6 +106,33 @@ STOPWORDS = {
     "syna",
     "ii",
     "iii",
+    "nebo",
+    "stavu",
+    "dobrém",
+    "dobrem",
+    "okolí",
+    "okoli",
+    "poptávka",
+    "poptavka",
+    "poptáváme",
+    "kúpim",
+    "kupím",
+    "kupim",
+    "nabídněte",
+    "nabidnete",
+    "sbírám",
+    "sbiram",
+    "vezmu",
+    "mám",
+    "mam",
+    "zájem",
+    "zajem",
+    "prosím",
+    "prosim",
+    "jakékoliv",
+    "jakekoliv",
+    "větší",
+    "množství",
 }
 LISTING_TYPE_LABELS = {"offer": "Продаю", "demand": "Куплю / ищу", "buyout": "Перекупщики"}
 TOKEN_RE = re.compile(r"[a-zá-žA-ZÁ-Ž][\wá-žÁ-Ž]+", re.UNICODE)
@@ -143,6 +170,7 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     df["listing_type"] = df["listing_type"].fillna("offer")
     if "subcategory" not in df:
         df["subcategory"] = None
+    df["is_demo"] = pd.to_numeric(df["id"], errors="coerce").fillna(0) >= config.SAMPLE_ID_BASE
     # Тег «рубрика/подкатегория» — для группировки на уровне подкатегорий.
     sub = df["subcategory"].fillna("").astype(str)
     df["tag"] = df["category"].where(sub == "", df["category"] + "/" + sub)

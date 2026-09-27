@@ -311,3 +311,43 @@ def test_discover_and_scrape_by_subcategory(tmp_path):
         kinds = {r[0] for r in conn.execute("SELECT DISTINCT kind FROM market_counts")}
     assert subs == {"apple"}
     assert kinds <= {"subcategory"}  # замер подкатегории не перетирает итог рубрики
+
+
+# Заголовки из реальной выгрузки (сентябрь 2026) и ожидаемый тип.
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        ("Termokopírka ASTRA THERM 01 KOH-I-NOOR, koupím", "demand"),
+        ("Fakír z Benáres a jiné povídky - M. Pašek, KOD 211 (sháním)", "demand"),
+        ("Pláště-sháníme", "demand"),
+        ("Odvalovací frézka FO 6 - HLEDÁME", "demand"),
+        ("kúpim použité náhradní díly", "demand"),
+        ("Nabídněte TENTO(PEEM) TABURET SEDATKO PODNOŽNÍK", "demand"),
+        ("Retro medved - poptavam", "demand"),
+        ("Dell Xps 9320 Plus Koupím", "demand"),
+        ("Mam zájem o Apple iPhone", "demand"),
+        ("Sbírám STARÉ PIVNÍ LAHVE, SKLENICE, PULLITRY, KORBELE", "demand"),
+        ("[SHÁNÍM] grafickou kartu 4070 ti nebo 4070 ti Super", "demand"),
+        ("Odkoupení nemovitostí: Garáže, pozemky, podíly, lesy, pole", "buyout"),
+        ("Práce v Německu – 30 €/hod. – hledám pravou ruku", "offer"),
+        ("Rhodéský Ridgeback štěňátka s PP - poslední 2 pejsci", "offer"),
+        ("Štěňátka hledají nový domov", "offer"),
+        ("Prodám nebo vyměním, koupím i protiúčtem", "offer"),
+        ("Canon EF-S 55-250mm f/4-5.6 IS STM", "offer"),
+    ],
+)
+def test_classify_real_titles(title, expected):
+    assert scraper.classify_listing(title) == expected
+
+
+def test_reclassify_and_clear_sample(tmp_path):
+    path = tmp_path / "r.db"
+    scraper.seed_sample(path)
+    with db.get_connection(path) as conn:
+        conn.execute(
+            "UPDATE listings SET listing_type = 'demand' WHERE title LIKE 'Canon%' OR title LIKE 'Dyson%'"
+        )
+    changes = scraper.reclassify(path)
+    assert changes == {"demand->offer": 1}  # Dyson V11 Absolute вернулся в «продаю»
+    assert scraper.clear_sample(path) == 50
+    assert db.table_counts(path)["listings"] == 0

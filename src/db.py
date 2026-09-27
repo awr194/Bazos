@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS listings (
     query           TEXT,                      -- поисковый запрос, по которому найдено (если был)
     title           TEXT NOT NULL,
     listing_type    TEXT NOT NULL DEFAULT 'offer', -- offer = продаю, demand = «Koupím/Sháním»
+    description     TEXT,                      -- начало описания из списка (для классификации)
     price_czk       INTEGER,                   -- NULL, если цена «Dohodou» / «V textu»
     location        TEXT,
     psc             TEXT,                      -- почтовый индекс (PSČ)
@@ -76,6 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_listing ON listing_snapshots(listing_id
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("listings", "listing_type", "TEXT NOT NULL DEFAULT 'offer'"),
     ("listings", "subcategory", "TEXT"),
+    ("listings", "description", "TEXT"),
 ]
 POST_MIGRATION_SQL = """
 CREATE INDEX IF NOT EXISTS idx_listings_type ON listings(listing_type);
@@ -139,7 +141,7 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
                SET title = ?, price_czk = COALESCE(?, price_czk), location = COALESCE(?, location),
                    psc = COALESCE(?, psc), url = ?, posted_at = COALESCE(?, posted_at),
                    query = COALESCE(query, ?), listing_type = COALESCE(?, listing_type),
-                   subcategory = COALESCE(?, subcategory),
+                   subcategory = COALESCE(?, subcategory), description = COALESCE(?, description),
                    last_seen = ?, is_active = 1, removed_at = NULL
              WHERE id = ?
             """,
@@ -153,6 +155,7 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
                 item.get("query"),
                 item.get("listing_type"),
                 item.get("subcategory"),
+                item.get("description"),
                 seen_at,
                 item["id"],
             ),
@@ -160,9 +163,9 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
         return False
     conn.execute(
         """
-        INSERT INTO listings (id, category, subcategory, query, title, listing_type, price_czk,
-                              location, psc, url, posted_at, first_seen, last_seen, is_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        INSERT INTO listings (id, category, subcategory, query, title, listing_type, description,
+                              price_czk, location, psc, url, posted_at, first_seen, last_seen, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         """,
         (
             item["id"],
@@ -171,6 +174,7 @@ def upsert_listing(conn: sqlite3.Connection, item: dict[str, Any], seen_at: str)
             item.get("query"),
             item["title"],
             item.get("listing_type") or "offer",
+            item.get("description"),
             item.get("price_czk"),
             item.get("location"),
             item.get("psc"),
