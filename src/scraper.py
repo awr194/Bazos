@@ -38,15 +38,15 @@ log = logging.getLogger("bazos.scraper")
 
 # --- Регулярные выражения ----------------------------------------------------
 LISTING_HREF_RE = re.compile(r"/inzerat/(\d+)/")
-VIEWS_DETAIL_RE = re.compile(r"Vid[ěe]lo\s*:?\s*([\d\s\u00a0]+?)\s*(?:lid|osob)", re.IGNORECASE)
-VIEWS_LIST_RE = re.compile(r"(\d[\d\s\u00a0]*)\s*x\b")
-PRICE_RE = re.compile(r"(\d[\d\s\u00a0.]*)\s*K[čc]", re.IGNORECASE)
+VIEWS_DETAIL_RE = re.compile(r"Vid[ěe]lo\s*:?\s*([\d\s ]+?)\s*(?:lid|osob)", re.IGNORECASE)
+VIEWS_LIST_RE = re.compile(r"(\d[\d\s ]*)\s*x\b")
+PRICE_RE = re.compile(r"(\d[\d\s .]*)\s*K[čc]", re.IGNORECASE)
 DATE_RE = re.compile(r"\[\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})\s*\]")
 PSC_RE = re.compile(r"\b(\d{3})\s?(\d{2})\b")
-WS_RE = re.compile(r"[\s\u00a0]+")
+WS_RE = re.compile(r"[\s ]+")
 # «Zobrazeno 1-20 inzerátů z 12 345» — общее число объявлений в выдаче.
-TOTAL_RE = re.compile(r"Zobrazeno\s*\d+\s*[-–]\s*\d+\s*inzer\w*\s*z\s*(\d[\d\s\u00a0]*)", re.IGNORECASE)
-TOTAL_FALLBACK_RE = re.compile(r"\bz\s+(\d[\d\s\u00a0]*)\s*inzer", re.IGNORECASE)
+TOTAL_RE = re.compile(r"Zobrazeno\s*\d+\s*[-–]\s*\d+\s*inzer\w*\s*z\s*(\d[\d\s ]*)", re.IGNORECASE)
+TOTAL_FALLBACK_RE = re.compile(r"\bz\s+(\d[\d\s ]*)\s*inzer", re.IGNORECASE)
 
 # Объявления-«спрос»: покупатель сам пишет, что ищет. Проверяем начало заголовка/описания.
 _W = r"(?<![\w])"  # начало слова (\b плохо дружит с чешскими буквами в начале)
@@ -385,11 +385,14 @@ class BazosClient:
             time.sleep(wait)
         self._last_request = time.monotonic()
 
-    def get(self, url: str, params: dict[str, str] | None = None) -> httpx.Response | None:
+    def get(
+        self, url: str, params: dict[str, str] | None = None, headers: dict[str, str] | None = None
+    ) -> httpx.Response | None:
         """GET с джиттером и повторами. Возвращает ответ (в т.ч. 404) или None при сбое сети."""
+        extra_headers = headers or {}
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
-            headers = {"User-Agent": random.choice(config.USER_AGENTS)}
+            headers = {"User-Agent": random.choice(config.USER_AGENTS), **extra_headers}
             try:
                 resp = self._client.get(url, params=params, headers=headers)
             except httpx.HTTPError as exc:
