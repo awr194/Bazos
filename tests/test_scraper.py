@@ -59,7 +59,7 @@ REMOVED_HTML = "<html><body><h1>Inzerát byl vymazán</h1></body></html>"
     "text,expected",
     [
         ("12 500 Kč", 12500),
-        ("8 500 Kč", 8500),
+        ("8\u00a0500 Kč", 8500),
         ("Dohodou", None),
         ("V textu", None),
         ("Zdarma", 0),
@@ -200,7 +200,7 @@ def test_classify_listing(title, description, expected):
 
 
 def test_parse_total_count():
-    html = "<div class='listainzerat'>Zobrazeno 1-20 inzerátů z 12 345</div>"
+    html = "<div class='listainzerat'>Zobrazeno 1-20 inzerátů z 12\u00a0345</div>"
     assert scraper.parse_total_count(html) == 12345
     assert scraper.parse_total_count("<p>z 987 inzerátů</p>") == 987
     assert scraper.parse_total_count("<p>nic</p>") is None

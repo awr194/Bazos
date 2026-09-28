@@ -38,15 +38,15 @@ log = logging.getLogger("bazos.scraper")
 
 # --- Регулярные выражения ----------------------------------------------------
 LISTING_HREF_RE = re.compile(r"/inzerat/(\d+)/")
-VIEWS_DETAIL_RE = re.compile(r"Vid[ěe]lo\s*:?\s*([\d\s ]+?)\s*(?:lid|osob)", re.IGNORECASE)
-VIEWS_LIST_RE = re.compile(r"(\d[\d\s ]*)\s*x\b")
-PRICE_RE = re.compile(r"(\d[\d\s .]*)\s*K[čc]", re.IGNORECASE)
+VIEWS_DETAIL_RE = re.compile(r"Vid[ěe]lo\s*:?\s*([\d\s\u00a0]+?)\s*(?:lid|osob)", re.IGNORECASE)
+VIEWS_LIST_RE = re.compile(r"(\d[\d\s\u00a0]*)\s*x\b")
+PRICE_RE = re.compile(r"(\d[\d\s\u00a0.]*)\s*K[čc]", re.IGNORECASE)
 DATE_RE = re.compile(r"\[\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})\s*\]")
 PSC_RE = re.compile(r"\b(\d{3})\s?(\d{2})\b")
-WS_RE = re.compile(r"[\s ]+")
+WS_RE = re.compile(r"[\s\u00a0]+")
 # «Zobrazeno 1-20 inzerátů z 12 345» — общее число объявлений в выдаче.
-TOTAL_RE = re.compile(r"Zobrazeno\s*\d+\s*[-–]\s*\d+\s*inzer\w*\s*z\s*(\d[\d\s ]*)", re.IGNORECASE)
-TOTAL_FALLBACK_RE = re.compile(r"\bz\s+(\d[\d\s ]*)\s*inzer", re.IGNORECASE)
+TOTAL_RE = re.compile(r"Zobrazeno\s*\d+\s*[-–]\s*\d+\s*inzer\w*\s*z\s*(\d[\d\s\u00a0]*)", re.IGNORECASE)
+TOTAL_FALLBACK_RE = re.compile(r"\bz\s+(\d[\d\s\u00a0]*)\s*inzer", re.IGNORECASE)
 
 # Объявления-«спрос»: покупатель сам пишет, что ищет. Проверяем начало заголовка/описания.
 _W = r"(?<![\w])"  # начало слова (\b плохо дружит с чешскими буквами в начале)
@@ -1029,9 +1029,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Сбор по подкатегориям завершён: {stats}")
         return 0
     if args.count:
-        for row in count_market(categories, db_path=args.db):
+        rows = count_market(categories, db_path=args.db)
+        for row in rows:
             total = "н/д" if row["total"] is None else f"{row['total']:,}".replace(",", " ")
-            print(f"{row['category']:<8} {row['kind']:<7} {row['query'] or '(вся рубрика)':<14} {total}")
+            print(f"{row['category']:<10} {total:>9}")
+        grand = sum(row["total"] or 0 for row in rows)
+        print(f"{'ИТОГО':<10} {grand:>9,}".replace(",", " "))
         return 0
     if args.demand:
         # Карточки не открываем: просмотры есть в ленте, а 20 рубрик × 3 страницы × 20 карточек
