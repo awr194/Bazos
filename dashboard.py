@@ -61,7 +61,8 @@ def render_demand(data: pd.DataFrame) -> None:
     """Вкладка «Спрос»: объявления покупателей против предложения."""
     st.caption(
         "Bazos не публикует, что люди вводят в поиск, поэтому спрос измеряется двумя способами: "
-        "**явный** — объявления покупателей «Koupím / Sháním / Hledám» (`python -m src.scraper --demand`), "
+        "**явный** — объявления покупателей «Koupím / Sháním / Hledám» в ленте рубрик "
+        "(`python -m src.scraper --demand`), "
         "**скрытый** — просмотры (VPH) объявлений о продаже. Перекупщики («Vykoupím») учитываются отдельно."
     )
     o, w = analytics.offers(data), analytics.wanted(data)
@@ -69,18 +70,22 @@ def render_demand(data: pd.DataFrame) -> None:
     balance = analytics.market_balance(load_market_counts())
     if categories:
         balance = balance[balance["category"].isin(categories)]
-    offers_total = balance["offers_total"].sum() if not balance.empty else 0
-    demand_total = balance["demand_hits"].sum() if not balance.empty else 0
+    # Доля спроса — только по обходу рубрик (query пустой): там обе стороны рынка попадают в выборку
+    # одинаково. Объявления, найденные раньше поиском по «koupím», долю бы завысили.
+    crawl = data[data["query"].isna()] if "query" in data else data
+    crawl_offers = int((crawl["listing_type"] == "offer").sum())
+    crawl_wanted = int((crawl["listing_type"] == "demand").sum())
+    crawl_total = crawl_offers + crawl_wanted
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Собрано «продаю»", fmt_int(len(o)))
     c2.metric("Собрано «куплю / ищу»", fmt_int(len(w)))
     c3.metric(
-        "Спрос на 1000 объявлений рынка",
-        f"{demand_total / offers_total * 1000:.1f}" if offers_total else "—",
-        help="По замеру --count: объявления по словам спроса на 1000 объявлений в выбранных рубриках. "
-        "Соотношение собранных объявлений для этого не годится: спрос собирается прицельным поиском, "
-        "а продажи — только с первых страниц рубрик.",
+        "Спрос на 1000 объявлений",
+        f"{crawl_wanted / crawl_total * 1000:.1f}" if crawl_total else "—",
+        help="Сколько объявлений «куплю / ищу» приходится на 1000 объявлений в ленте выбранных рубрик "
+        f"(по обходу рубрик: {fmt_int(crawl_total)} объявлений). Объявления, собранные раньше через "
+        "поиск Bazos, не учитываются: они завышают долю спроса.",
     )
     c4.metric("Перекупщиков", fmt_int(buyouts))
 
@@ -89,27 +94,20 @@ def render_demand(data: pd.DataFrame) -> None:
     if balance.empty:
         st.info(
             "Замеров общего объёма ещё нет. Выполните `python -m src.scraper --count` — "
-            "это 4 запроса на рубрику (≈ 1 минута на все рубрики)."
+            "это 1 запрос на рубрику (≈ 1 минута на все рубрики)."
         )
     else:
         balance["category"] = balance["category"].map(cat_label)
         st.dataframe(
-            balance.rename(
-                columns={
-                    "category": "Категория",
-                    "offers_total": "Всего объявлений в рубрике",
-                    "demand_hits": "Найдено по «koupím/sháním/hledám»",
-                    "demand_per_1000": "Спрос на 1000 объявлений",
-                }
+            balance[["category", "offers_total"]].rename(
+                columns={"category": "Категория", "offers_total": "Всего объявлений в рубрике"}
             ),
             hide_index=True,
             use_container_width=True,
         )
 
     if w.empty:
-        st.info(
-            "В выборке нет объявлений покупателей. Соберите их: `python -m src.scraper --demand --pages 3`."
-        )
+        st.info("В выборке нет объявлений покупателей. Соберите их: `python -m src.scraper --demand`.")
         return
 
     # --- Что ищут: ключевые слова ----------------------------------------------------
@@ -159,8 +157,8 @@ def render_demand(data: pd.DataFrame) -> None:
         )
         st.caption(
             "«Ищут / продают» > 1 — дефицит: покупателей больше, чем предложений; пусто — предложений "
-            "в выборке нет. Сравнивайте слова между собой: абсолютное значение завышено, потому что "
-            "спрос собирается прицельным поиском, а продажи — только с первых страниц рубрик."
+            "в выборке нет. Если в базе остались объявления, найденные раньше поиском по «koupím», "
+            "значение завышено — сравнивайте слова между собой."
         )
 
     # --- По категориям -------------------------------------------------------------------
@@ -318,7 +316,7 @@ with st.sidebar.expander("Сбор с Bazos.cz (медленно)"):
         load_market_counts.clear()
         st.success(f"Готово: {stats}")
     st.divider()
-    if st.button("🛒 Собрать спрос («koupím…»)", use_container_width=True, disabled=not categories):
+    if st.button("🛒 Собрать спрос (лента рубрик)", use_container_width=True, disabled=not categories):
         with st.spinner("Собираю объявления покупателей…"):
             stats = scraper.scrape_demand(categories, int(pages))
         load_data.clear()

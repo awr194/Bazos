@@ -59,7 +59,7 @@ REMOVED_HTML = "<html><body><h1>Inzerát byl vymazán</h1></body></html>"
     "text,expected",
     [
         ("12 500 Kč", 12500),
-        ("8\u00a0500 Kč", 8500),
+        ("8 500 Kč", 8500),
         ("Dohodou", None),
         ("V textu", None),
         ("Zdarma", 0),
@@ -116,8 +116,11 @@ def test_parse_detail_page():
     assert scraper.parse_detail_page(REMOVED_HTML).status == "removed"
 
 
-def _client(handler):
-    return scraper.BazosClient(min_delay=0, max_delay=0, transport=httpx.MockTransport(handler))
+def _client(handler, robots: bool = False):
+    # robots=False: в большинстве тестов обработчик не отдаёт robots.txt, проверка там не нужна.
+    return scraper.BazosClient(
+        min_delay=0, max_delay=0, transport=httpx.MockTransport(handler), respect_robots=robots
+    )
 
 
 def test_scrape_and_update_flow(tmp_path):
@@ -197,7 +200,7 @@ def test_classify_listing(title, description, expected):
 
 
 def test_parse_total_count():
-    html = "<div class='listainzerat'>Zobrazeno 1-20 inzerátů z 12\u00a0345</div>"
+    html = "<div class='listainzerat'>Zobrazeno 1-20 inzerátů z 12 345</div>"
     assert scraper.parse_total_count(html) == 12345
     assert scraper.parse_total_count("<p>z 987 inzerátů</p>") == 987
     assert scraper.parse_total_count("<p>nic</p>") is None
@@ -223,28 +226,39 @@ def test_demand_listing_budget_and_type():
     assert items["222"]["listing_type"] == "offer" and items["222"]["price_czk"] == 9000
 
 
+BAZOS_ROBOTS = "User-agent: *\nDisallow: /search.php\nDisallow: /*hledat=\nDisallow: /*humkreis\n"
+
+
 def test_scrape_demand_and_count_market(tmp_path):
     db_path = tmp_path / "d.db"
+    robots_fetches = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.params.get("hledat"):
-            return httpx.Response(200, text=DEMAND_LIST_HTML)
-        return httpx.Response(200, text="<p>Zobrazeno 1-20 inzerátů z 50 000</p>")
+        assert "hledat" not in request.url.params  # поиск Bazos запрещён в robots.txt
+        if request.url.path == "/robots.txt":
+            robots_fetches.append(request.url.host)
+            return httpx.Response(200, text=BAZOS_ROBOTS)
+        return httpx.Response(200, text=DEMAND_LIST_HTML)
 
-    with _client(handler) as client:
+    with _client(handler, robots=True) as client:
         stats = scraper.scrape_demand(["mobil"], pages=1, db_path=db_path, client=client)
         rows = scraper.count_market(["mobil", "pc"], db_path=db_path, client=client)
-    assert stats["new"] == 2  # одни и те же объявления по 3 запросам не дублируются
+    assert stats["new"] == 2 and stats["wanted"] == 1  # спрос — из обычной ленты рубрики
     with db.get_connection(db_path) as conn:
         types = dict(conn.execute("SELECT id, listing_type FROM listings").fetchall())
         kinds = {r[0] for r in conn.execute("SELECT DISTINCT kind FROM market_counts")}
     assert types == {"111": "demand", "222": "offer"}
-    assert kinds == {"offer", "demand"}
-    assert {(r["category"], r["kind"], r["total"]) for r in rows if r["query"] is None} == {
-        ("mobil", "offer", 50000),
-        ("pc", "offer", 50000),
-    }
-    assert all(r["total"] == 214 for r in rows if r["query"])
+    assert kinds == {"offer"}
+    assert [(r["category"], r["kind"], r["total"]) for r in rows] == [
+        ("mobil", "offer", 214),
+        ("pc", "offer", 214),
+    ]
+    assert robots_fetches == ["mobil.bazos.cz", "pc.bazos.cz"]
+
+
+def test_query_flag_is_disabled(capsys):
+    assert scraper.main(["--query", "iphone", "--categories", "mobil"]) == 2
+    assert "robots.txt" in capsys.readouterr().out
 
 
 HOMEPAGE_HTML = """
