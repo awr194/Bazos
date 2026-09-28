@@ -2,10 +2,9 @@
 
 Режимы CLI:
     python -m src.scraper --categories mobil pc --pages 2          # сбор новых объявлений
-    python -m src.scraper --query "iphone 13" --categories mobil   # сбор по поисковому запросу
     python -m src.scraper --update                                 # перепроверка активных
-    python -m src.scraper --demand --pages 3                       # объявления «Koupím/Sháním»
-    python -m src.scraper --count                                  # общий объём рынка
+    python -m src.scraper --demand                                 # спрос «Koupím/Sháním» из рубрик
+    python -m src.scraper --count                                  # общее число объявлений в рубриках
     python -m src.scraper --discover                               # справочник рубрик и подкатегорий
     python -m src.scraper --by-subcategory --no-details --pages 1  # обход всех подкатегорий
     python -m src.scraper --seed-sample                            # демо-данные для дашборда
@@ -33,6 +32,7 @@ import httpx
 from selectolax.parser import HTMLParser, Node
 
 from src import config, db
+from src.robots import RobotsRules
 
 log = logging.getLogger("bazos.scraper")
 
@@ -357,10 +357,13 @@ class BazosClient:
         max_delay: float = config.MAX_DELAY,
         max_retries: int = config.MAX_RETRIES,
         transport: httpx.BaseTransport | None = None,
+        respect_robots: bool = True,
     ) -> None:
         self.min_delay = min_delay
         self.max_delay = max_delay
         self.max_retries = max_retries
+        self.respect_robots = respect_robots
+        self._robots: dict[str, RobotsRules] = {}  # правила robots.txt по хосту
         self._last_request = 0.0
         self._client = httpx.Client(
             headers=config.BASE_HEADERS,
@@ -385,10 +388,40 @@ class BazosClient:
             time.sleep(wait)
         self._last_request = time.monotonic()
 
+    def _load_robots(self, origin: str) -> RobotsRules:
+        """robots.txt хоста; если его нет или он недоступен — ограничений нет."""
+        self._throttle()
+        try:
+            resp = self._client.get(
+                f"{origin}/robots.txt", headers={"User-Agent": random.choice(config.USER_AGENTS)}
+            )
+        except httpx.HTTPError as exc:
+            log.warning("Не удалось получить %s/robots.txt: %s", origin, exc)
+            return RobotsRules()
+        if resp.status_code != 200:
+            return RobotsRules()
+        return RobotsRules.parse(resp.text)
+
+    def allowed(self, url: str, params: dict[str, str] | None = None) -> bool:
+        """Разрешает ли robots.txt сайта запрос по этому адресу (с учётом query-параметров)."""
+        if not self.respect_robots:
+            return True
+        u = httpx.URL(url, params=params)
+        origin = f"{u.scheme}://{u.host}"
+        if origin not in self._robots:
+            self._robots[origin] = self._load_robots(origin)
+        return self._robots[origin].is_allowed(u.raw_path.decode("ascii", "replace"))
+
     def get(
         self, url: str, params: dict[str, str] | None = None, headers: dict[str, str] | None = None
     ) -> httpx.Response | None:
-        """GET с джиттером и повторами. Возвращает ответ (в т.ч. 404) или None при сбое сети."""
+        """GET с джиттером и повторами. Возвращает ответ (в т.ч. 404) или None при сбое сети.
+
+        Адреса, запрещённые robots.txt сайта, не запрашиваются (тоже None).
+        """
+        if not self.allowed(url, params):
+            log.warning("robots.txt запрещает %s — запрос не отправлен", httpx.URL(url, params=params))
+            return None
         extra_headers = headers or {}
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
@@ -595,37 +628,42 @@ def scrape_by_subcategory(
 
 def scrape_demand(
     categories: Iterable[str],
-    pages: int = 1,
-    queries: Iterable[str] = config.DEMAND_QUERIES,
+    pages: int = config.DEMAND_PAGES,
     fetch_details: bool = False,
     detail_limit: int | None = None,
     db_path: Path | str | None = None,
     client: BazosClient | None = None,
 ) -> dict[str, int]:
-    """Собирает объявления «Koupím / Sháním / Hledám» — то, что люди сами ищут."""
-    total = {"pages": 0, "found": 0, "new": 0, "snapshots": 0}
-    own_client = client is None
-    client = client or BazosClient()
-    try:
-        for q in queries:
-            stats = scrape(categories, pages, q, fetch_details, detail_limit, db_path, client)
-            for k in total:
-                total[k] += stats[k]
-    finally:
-        if own_client:
-            client.close()
-    return total
+    """Собирает спрос («Koupím / Sháním / Hledám») обходом страниц рубрик.
+
+    Поиск Bazos (`?hledat=`) запрещён в robots.txt, поэтому спрос берётся из обычной ленты
+    рубрик: объявления покупателей публикуются там же, классификатор их отделяет. Обе стороны
+    рынка попадают в выборку одинаково, так что доля спроса не завышена прицельным поиском.
+    """
+    cats = list(categories)
+    stats = scrape(cats, pages, None, fetch_details, detail_limit, db_path, client)
+    if not cats:
+        stats["wanted"] = 0
+        return stats
+    placeholders = ",".join("?" * len(cats))
+    with db.get_connection(db_path) as conn:
+        stats["wanted"] = conn.execute(
+            "SELECT COUNT(*) FROM listings WHERE listing_type = 'demand' AND query IS NULL"
+            f" AND category IN ({placeholders})",
+            cats,
+        ).fetchone()[0]
+    return stats
 
 
 def count_market(
     categories: Iterable[str],
-    queries: Iterable[str] = config.DEMAND_QUERIES,
     db_path: Path | str | None = None,
     client: BazosClient | None = None,
 ) -> list[dict[str, Any]]:
-    """Только считает объём рынка: сколько всего объявлений в рубрике и по запросам спроса.
+    """Только считает объём рынка: сколько всего объявлений в каждой рубрике.
 
-    1 запрос на рубрику + 1 на каждый запрос спроса; сами объявления не сохраняются.
+    1 запрос на рубрику, сами объявления не сохраняются. Замер по словам спроса через поиск
+    больше не делается: поиск Bazos запрещён в robots.txt.
     """
     db.init_db(db_path)
     rows: list[dict[str, Any]] = []
@@ -633,16 +671,15 @@ def count_market(
     client = client or BazosClient()
     try:
         for category in categories:
-            for q in [None, *queries]:
-                resp = client.get(config.category_url(category), params=search_params(q) if q else None)
-                ok = resp is not None and resp.status_code == 200
-                total = parse_total_count(resp.text) if ok else None
-                rows.append({"category": category, "kind": market_kind(q), "query": q, "total": total})
-                if total is not None:
-                    with db.get_connection(db_path) as conn:
-                        db.add_market_count(conn, db.utcnow(), category, market_kind(q), total, q)
-                else:
-                    log.warning("Не удалось определить общее число для %s / %s", category, q or "—")
+            resp = client.get(config.category_url(category))
+            ok = resp is not None and resp.status_code == 200
+            total = parse_total_count(resp.text) if ok else None
+            rows.append({"category": category, "kind": "offer", "query": None, "total": total})
+            if total is not None:
+                with db.get_connection(db_path) as conn:
+                    db.add_market_count(conn, db.utcnow(), category, "offer", total)
+            else:
+                log.warning("Не удалось определить общее число объявлений для %s", category)
     finally:
         if own_client:
             client.close()
@@ -897,10 +934,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--pages",
         type=int,
-        default=config.DEFAULT_PAGES,
-        help="сколько страниц (по 20 объявлений) обходить в каждой категории",
+        default=None,
+        help="сколько страниц (по 20 объявлений) обходить в каждой категории "
+        f"(по умолчанию {config.DEFAULT_PAGES}, для --demand {config.DEMAND_PAGES})",
     )
-    p.add_argument("--query", help="поисковый запрос (hledat) внутри категорий")
+    p.add_argument("--query", help="отключено: поиск Bazos (?hledat=) запрещён в robots.txt")
     p.add_argument(
         "--no-details",
         action="store_true",
@@ -914,12 +952,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--demand",
         action="store_true",
-        help="собрать объявления покупателей («koupím», «sháním», «hledám») — что люди ищут",
+        help="собрать спрос: обойти страницы рубрик и отделить объявления «koupím / sháním / hledám»",
     )
     p.add_argument(
         "--count",
         action="store_true",
-        help="только посчитать общий объём рынка по рубрикам и запросам спроса (без сохранения объявлений)",
+        help="только посчитать общее число объявлений в рубриках (без сохранения объявлений)",
     )
     p.add_argument(
         "--seed-sample", action="store_true", help="заполнить базу демо-данными (50 объявлений) и выйти"
@@ -970,14 +1008,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Проверка завершена: {stats}")
         return 0
     categories = args.categories or list(config.CATEGORY_LABELS)
+    if args.query:
+        print(
+            "--query отключён: поиск Bazos (?hledat=…) запрещён в robots.txt сайта. "
+            "Спрос собирайте обходом рубрик: python -m src.scraper --demand"
+        )
+        return 2
+    pages = args.pages or (config.DEMAND_PAGES if args.demand else config.DEFAULT_PAGES)
     if args.subcategory and len(categories) != 1:
         print("--subcategory требует ровно одну рубрику: --categories mobil --subcategory apple")
         return 2
     if args.by_subcategory:
         stats = scrape_by_subcategory(
             categories,
-            args.pages,
-            args.query,
+            pages,
             fetch_details=not args.no_details,
             detail_limit=args.detail_limit,
             db_path=args.db,
@@ -990,19 +1034,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{row['category']:<8} {row['kind']:<7} {row['query'] or '(вся рубрика)':<14} {total}")
         return 0
     if args.demand:
-        stats = scrape_demand(
-            categories,
-            args.pages,
-            fetch_details=not args.no_details,
-            detail_limit=args.detail_limit,
-            db_path=args.db,
-        )
+        # Карточки не открываем: просмотры есть в ленте, а 20 рубрик × 3 страницы × 20 карточек
+        # заняли бы почти час. Для просмотров по карточкам — обычный сбор или --update.
+        stats = scrape_demand(categories, pages, db_path=args.db)
         print(f"Сбор спроса завершён: {stats}")
         return 0
     stats = scrape(
         categories,
-        args.pages,
-        args.query,
+        pages,
         fetch_details=not args.no_details,
         detail_limit=args.detail_limit,
         db_path=args.db,
